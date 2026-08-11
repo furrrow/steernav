@@ -10,6 +10,7 @@ dependencies = [
     "OnlineVideoDepthAnything",
     "tqdm>=4.70.0",
     "ipykernel>=7.3.0",
+    "transformers>=5.15.0",
 ]
 
 [[tool.uv.index]]
