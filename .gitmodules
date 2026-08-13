@@ -4,3 +4,6 @@
 [submodule "services/OnlineVideoDepthAnything"]
 	path = services/OnlineVideoDepthAnything
 	url = git@github.com:furrrow/OnlineVideoDepthAnything.git
+[submodule "services/ptc-depth"]
+	path = services/ptc-depth
+	url = git@github.com:furrrow/ptc-depth.git

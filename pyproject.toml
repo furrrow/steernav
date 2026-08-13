@@ -8,6 +8,7 @@ dependencies = [
     "flash-attn",
     "sam3",
     "OnlineVideoDepthAnything",
+    "ptc-depth",
     "tqdm>=4.70.0",
     "ipykernel>=7.3.0",
     "transformers>=5.15.0",
@@ -26,6 +27,7 @@ explicit = true
 [tool.uv.sources]
 sam3 = { workspace = true }
 OnlineVideoDepthAnything = { workspace = true }
+ptc-depth = { workspace = true }
 flash-attn = { index = "astral-cu128" }
 
 
