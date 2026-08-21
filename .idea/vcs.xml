@@ -2,7 +2,10 @@
 <project version="4">
   <component name="VcsDirectoryMappings">
     <mapping directory="" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/depth-anything-3" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/services/Depth-Anything-V2" vcs="Git" />
     <mapping directory="$PROJECT_DIR$/services/OnlineVideoDepthAnything" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/services/ptc-depth" vcs="Git" />
     <mapping directory="$PROJECT_DIR$/services/sam3" vcs="Git" />
   </component>
 </project>

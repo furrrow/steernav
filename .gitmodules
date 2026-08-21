@@ -7,3 +7,9 @@
 [submodule "services/ptc-depth"]
 	path = services/ptc-depth
 	url = git@github.com:furrrow/ptc-depth.git
+[submodule "services/Depth-Anything-V2"]
+	path = services/Depth-Anything-V2
+	url = git@github.com:furrrow/Depth-Anything-V2.git
+[submodule "services/Depth-Anything-3"]
+	path = services/Depth-Anything-3
+	url = git@github.com:furrrow/Depth-Anything-3.git

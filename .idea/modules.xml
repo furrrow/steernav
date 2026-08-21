@@ -2,7 +2,10 @@
 <project version="4">
   <component name="ProjectModuleManager">
     <modules>
-      <module fileurl="file://$PROJECT_DIR$/.idea/onlinevideodepthanything.iml" filepath="$PROJECT_DIR$/.idea/onlinevideodepthanything.iml" />
+      <module fileurl="file://$PROJECT_DIR$/.idea/OnlineVideoDepthAnything.iml" filepath="$PROJECT_DIR$/.idea/OnlineVideoDepthAnything.iml" />
+      <module fileurl="file://$PROJECT_DIR$/.idea/custom_utils.iml" filepath="$PROJECT_DIR$/.idea/custom_utils.iml" />
+      <module fileurl="file://$PROJECT_DIR$/.idea/depth-anything-3.iml" filepath="$PROJECT_DIR$/.idea/depth-anything-3.iml" />
+      <module fileurl="file://$PROJECT_DIR$/.idea/depth-anything-v2.iml" filepath="$PROJECT_DIR$/.idea/depth-anything-v2.iml" />
       <module fileurl="file://$PROJECT_DIR$/.idea/ptc-depth.iml" filepath="$PROJECT_DIR$/.idea/ptc-depth.iml" />
       <module fileurl="file://$PROJECT_DIR$/.idea/sam3.iml" filepath="$PROJECT_DIR$/.idea/sam3.iml" />
       <module fileurl="file://$PROJECT_DIR$/.idea/steernav.iml" filepath="$PROJECT_DIR$/.idea/steernav.iml" />
