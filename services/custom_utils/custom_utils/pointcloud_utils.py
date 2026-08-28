@@ -4,7 +4,37 @@ https://github.com/gershom96/VLA_DataGeneration/blob/main/utils/pointcloud_utils
 import cv2
 import numpy as np
 from scipy.ndimage import distance_transform_edt
+from dataclasses import dataclass
+import time
+import numba
 
+@dataclass
+class BEVGrid:
+    x_min: float
+    x_max: float
+    y_min: float
+    y_max: float
+    resolution: float
+    height: int
+    width: int
+
+    @classmethod
+    def create(cls, x_min, x_max, y_min, y_max, resolution,):
+        # formerly def bev_grid_params(x_min, x_max, y_min, y_max, resolution)
+        """
+        Compute BEV grid dimensions.
+        """
+        width = int(np.ceil((x_max - x_min) / resolution))
+        height = int(np.ceil((y_max - y_min) / resolution))
+        return cls(
+            x_min=x_min,
+            x_max=x_max,
+            y_min=y_min,
+            y_max=y_max,
+            resolution=resolution,
+            height=height,
+            width=width,
+        )
 
 def camera_to_base_transform(camera_height=1.5):
     """
@@ -525,30 +555,17 @@ def filter_points_by_height_and_roi(
         filtered_points: (M, 3)
         valid_mask: boolean mask over flattened input
     """
-    pts = np.asarray(points_xyz, dtype=np.float32).reshape(-1, 3)
+    pts = np.ascontiguousarray(points_xyz, dtype=np.float32).reshape(-1, 3)
 
-    finite = np.isfinite(pts).all(axis=1)
-    x = pts[:, 0]
-    y = pts[:, 1]
-    z = pts[:, z_axis]
+    x, y, z = pts[:, 0], pts[:, 1], pts[:, z_axis]
 
     roi = (x >= x_min) & (x <= x_max) & (y >= y_min) & (y <= y_max)
     height_ok = (z >= h_min) & (z <= h_max)
 
-    valid_mask = finite & roi & height_ok
+    valid_mask = roi & height_ok
     return pts[valid_mask], valid_mask
 
-
-def bev_grid_params(x_min, x_max, y_min, y_max, resolution):
-    """
-    Compute BEV grid dimensions.
-    """
-    width = int(np.ceil((x_max - x_min) / resolution))
-    height = int(np.ceil((y_max - y_min) / resolution))
-    return height, width
-
-
-def points_to_bev_indices(points_xyz, x_min, y_min, resolution, H, W):
+def points_to_bev_indices(points_xyz, grid: BEVGrid):
     """
     Convert robot-frame XY points into BEV grid indices.
 
@@ -558,10 +575,10 @@ def points_to_bev_indices(points_xyz, x_min, y_min, resolution, H, W):
     x = points_xyz[:, 0]
     y = points_xyz[:, 1]
 
-    cols = np.floor((x - x_min) / resolution).astype(np.int32)
-    rows = np.floor((y - y_min) / resolution).astype(np.int32)
+    cols = np.floor((x - grid.x_min) / grid.resolution).astype(np.int32)
+    rows = np.floor((y - grid.y_min) / grid.resolution).astype(np.int32)
 
-    in_bounds = (rows >= 0) & (rows < H) & (cols >= 0) & (cols < W)
+    in_bounds = (rows >= 0) & (rows < grid.height) & (cols >= 0) & (cols < grid.width)
     return rows, cols, in_bounds
 
 def points_to_pseudo_laserscan(
@@ -664,6 +681,65 @@ def bresenham_line(r0, c0, r1, c1):
     return cells
 
 
+def rasterize_lines_vectorized(r0, r1, c0, c1, occluder_grid):
+    """
+    Vectorized batch line rasterization for multiple line segments.
+    r0, r1, c0, c1 are 1D arrays of endpoints.
+    """
+    dr = np.abs(r1 - r0)
+    dc = np.abs(c1 - c0)
+    num_steps = np.maximum(dr, dc)
+    max_len = np.max(num_steps)
+
+    if max_len == 0:
+        return
+
+    # Normalize step progress from 0.0 to 1.0
+    t = np.linspace(0, 1, num=max_len + 1, dtype=np.float32)  # Shape: (S,)
+
+    # Interpolate for all line segments simultaneously via broadcasting
+    # Shape: (N_lines, S)
+    r_interp = np.round(r0[:, None] + (r1 - r0)[:, None] * t).astype(np.int32)
+    c_interp = np.round(c0[:, None] + (c1 - c0)[:, None] * t).astype(np.int32)
+
+    # Valid step mask per line length
+    step_indices = np.arange(max_len + 1)
+    valid_mask = step_indices <= num_steps[:, None]
+
+    # Boundary filtering & grid setting
+    H, W = occluder_grid.shape
+    valid_mask &= (r_interp >= 0) & (r_interp < H) & (c_interp >= 0) & (c_interp < W)
+
+    occluder_grid[r_interp[valid_mask], c_interp[valid_mask]] = True
+
+@numba.njit(fastmath=True)
+def draw_lines_numba(r0_arr, r1_arr, c0_arr, c1_arr, occluder):
+    # faster version of bresenham_line
+    H, W = occluder.shape
+    for i in numba.prange(len(r0_arr)):
+        r0, r1 = r0_arr[i], r1_arr[i]
+        c0, c1 = c0_arr[i], c1_arr[i]
+
+        dr = abs(r1 - r0)
+        dc = abs(c1 - c0)
+        sr = 1 if r0 < r1 else -1
+        sc = 1 if c0 < c1 else -1
+        err = dc - dr
+
+        r, c = r0, c0
+        while True:
+            if 0 <= r < H and 0 <= c < W:
+                occluder[r, c] = True
+            if r == r1 and c == c1:
+                break
+            e2 = 2 * err
+            if e2 > -dr:
+                err -= dr
+                c += sc
+            if e2 < dc:
+                err += dc
+                r += sr
+
 def _grid_centers_from_indices(rows, cols, x_min, y_min, resolution):
     x = x_min + (cols.astype(np.float32) + 0.5) * resolution
     y = y_min + (rows.astype(np.float32) + 0.5) * resolution
@@ -680,15 +756,9 @@ def _continuous_neighbor_mask(points_a, points_b, max_neighbor_distance_m):
 
 
 def rasterize_organized_occluders(
-    points_xyz,
-    x_min,
-    x_max,
-    y_min,
-    y_max,
-    resolution,
-    H,
-    W,
-    max_neighbor_distance_m=0.5,
+        points_xyz,
+        grid: BEVGrid,
+        max_neighbor_distance_m=0.5,
 ):
     """
     Rasterize an organized point map into BEV occluder cells.
@@ -699,47 +769,110 @@ def rasterize_organized_occluders(
     at range. This fills those sub-pixel BEV gaps for visibility ray stopping
     without treating every return as an obstacle.
     """
+    t0 = time.perf_counter()
     pts = np.asarray(points_xyz, dtype=np.float32)
+    H, W = grid.height, grid.width
+
     if pts.ndim != 3 or pts.shape[-1] != 3:
-        flat = pts.reshape(-1, 3)
-        rows, cols, in_bounds = points_to_bev_indices(flat, x_min, y_min, resolution, H, W)
+        flat_pts = pts.reshape(-1, 3)
+        rows, cols, in_bounds = points_to_bev_indices(flat_pts, grid)
         occluder = np.zeros((H, W), dtype=bool)
         occluder[rows[in_bounds], cols[in_bounds]] = True
         return occluder
 
+    t1 = time.perf_counter()
+    # print(f"initialize: {(t1 - t0) * 1000:.2f} ms")
+
     finite = np.isfinite(pts).all(axis=-1)
+    x_pts, y_pts = pts[..., 0], pts[..., 1]
+
     roi = (
-        finite
-        & (pts[..., 0] >= x_min)
-        & (pts[..., 0] <= x_max)
-        & (pts[..., 1] >= y_min)
-        & (pts[..., 1] <= y_max)
+            finite
+            & (x_pts >= grid.x_min) & (x_pts <= grid.x_max)
+            & (y_pts >= grid.y_min) & (y_pts <= grid.y_max)
     )
-    occluder = np.zeros((H, W), dtype=bool)
+    occluder = np.zeros((H, W), dtype=np.uint8)
     if not np.any(roi):
         return occluder
 
+    # Precompute reciprocal resolution for speed
+    inv_res = 1.0 / grid.resolution
     rows = np.zeros(pts.shape[:2], dtype=np.int32)
     cols = np.zeros(pts.shape[:2], dtype=np.int32)
-    rows[roi] = np.floor((pts[..., 1][roi] - y_min) / resolution).astype(np.int32)
-    cols[roi] = np.floor((pts[..., 0][roi] - x_min) / resolution).astype(np.int32)
-    rows[roi] = np.clip(rows[roi], 0, H - 1)
-    cols[roi] = np.clip(cols[roi], 0, W - 1)
+
+    t2 = time.perf_counter()
+    # print(f"finite/roi: {(t2 - t1) * 1000:.2f} ms")
+
+    rows[roi] = np.clip(np.floor((y_pts[roi] - grid.y_min) * inv_res), 0, H - 1).astype(np.int32)
+    cols[roi] = np.clip(np.floor((x_pts[roi] - grid.x_min) * inv_res), 0, W - 1).astype(np.int32)
     occluder[rows[roi], cols[roi]] = True
 
-    neighbor_pairs = (
-        (pts[:, :-1], pts[:, 1:], roi[:, :-1], roi[:, 1:], rows[:, :-1], rows[:, 1:], cols[:, :-1], cols[:, 1:]),
-        (pts[:-1, :], pts[1:, :], roi[:-1, :], roi[1:, :], rows[:-1, :], rows[1:, :], cols[:-1, :], cols[1:, :]),
-    )
-    for points_a, points_b, roi_a, roi_b, rows_a, rows_b, cols_a, cols_b in neighbor_pairs:
-        continuous = roi_a & roi_b & _continuous_neighbor_mask(points_a, points_b, max_neighbor_distance_m)
-        for r0, r1, c0, c1 in zip(rows_a[continuous], rows_b[continuous], cols_a[continuous], cols_b[continuous]):
-            for rr, cc in bresenham_line(int(r0), int(c0), int(r1), int(c1)):
-                if 0 <= rr < H and 0 <= cc < W:
-                    occluder[rr, cc] = True
+    # chatgpt portion: ======================================================
+    # Raw projected surface
 
+    occluder[rows[roi], cols[roi],] = 1
+    # Bridge small gaps
+    kernel = np.ones((20, 20), dtype=np.uint8)
+    occluder = cv2.morphologyEx(occluder, cv2.MORPH_CLOSE, kernel,)
+    t4 = time.perf_counter()
+    print(f"rasterize: new occluder using cv2.morphologyEx: {(t4 - t2) * 1000:.2f} ms")
+    return occluder.astype(bool)
+    # chatgpt portion: ======================================================
+
+    # Check horizontal and vertical neighbor pairs
+    neighbor_slices = (
+        (slice(None), slice(None, -1), slice(None), slice(1, None)),  # Horizontal
+        (slice(None, -1), slice(None), slice(1, None), slice(None)),  # Vertical
+    )
+
+    t3 = time.perf_counter()
+    # print(f"projection, neighbor slices: {(t3 - t2) * 1000:.2f} ms")
+
+    for r_a, c_a, r_b, c_b in neighbor_slices:
+        roi_a, roi_b = roi[r_a, c_a], roi[r_b, c_b]
+        pts_a, pts_b = pts[r_a, c_a], pts[r_b, c_b]
+        rows_a, rows_b = rows[r_a, c_a], rows[r_b, c_b]
+        cols_a, cols_b = cols[r_a, c_a], cols[r_b, c_b]
+
+        continuous = roi_a & roi_b & _continuous_neighbor_mask(pts_a, pts_b, max_neighbor_distance_m)
+        needs_line = continuous & ((np.abs(rows_a - rows_b) > 1) | (np.abs(cols_a - cols_b) > 1))
+
+        if np.any(needs_line):
+            draw_lines_numba(
+                rows_a[needs_line],
+                rows_b[needs_line],
+                cols_a[needs_line],
+                cols_b[needs_line],
+                occluder
+            )
+    t4 = time.perf_counter()
+    print(f"rasterize_find neighbors: {(t4 - t3) * 1000:.2f} ms")
     return occluder
 
+def get_inbound_points(points_xyz, grid:BEVGrid):
+    points = np.asarray(points_xyz, dtype=np.float32).reshape(-1, 3)
+
+    if len(points) == 0:
+        return points
+
+    points = points[np.isfinite(points).all(axis=1)]
+
+    if len(points) == 0:
+        return points
+
+    _, _, in_bounds = points_to_bev_indices(points, grid)
+
+    return points[in_bounds]
+
+@numba.njit
+def _find_min_bin_hits(bin_idx, ranges, x_pts, y_pts, hit_ranges, hit_points):
+    for i in numba.prange(len(bin_idx)):
+        b = bin_idx[i]
+        r = ranges[i]
+        if r < hit_ranges[b]:
+            hit_ranges[b] = r
+            hit_points[b, 0] = x_pts[i]
+            hit_points[b, 1] = y_pts[i]
 
 def raytrace_visibility_from_points(
     points_xyz,
@@ -777,71 +910,52 @@ def raytrace_visibility_from_points(
         visible_free_mask: (H, W) bool
         known_mask: (H, W) bool
     """
-    H, W = bev_grid_params(x_min, x_max, y_min, y_max, resolution)
+    # 1. Grid
+    grid = BEVGrid.create(x_min, x_max, y_min, y_max, resolution,)
+    H, W = grid.height, grid.width
+    # 2. check for sources, prepare sources occupancy, pov, and occluder points
+    occupancy_points = get_inbound_points(points_xyz, grid)
+    fov_source = occupancy_points if fov_points_xyz is None else np.asarray(fov_points_xyz, dtype=np.float32)
+    occluder_source = fov_source if occluder_points_xyz is None else np.asarray(occluder_points_xyz, dtype=np.float32)
 
+    # 3. handle fov_points based on fov_points_xyz, bounds
     occupied = np.zeros((H, W), dtype=bool)
     visible_free = np.zeros((H, W), dtype=bool)
+    if fov_points_xyz is None:
+        fov_points = occupancy_points
+    else:
+        fov_points = fov_source.reshape(-1, 3)
+        fov_points = fov_points[np.isfinite(fov_points).all(axis=1)]
+        if len(fov_points) > 0:
+            _, _, fov_in_bounds = points_to_bev_indices(fov_points, grid)
+            fov_points = fov_points[fov_in_bounds]
 
+    if len(fov_points) == 0:
+        if len(occupancy_points) == 0:
+            return occupied, visible_free, occupied | visible_free
+        print("no fov_points left, defaulting back to occupancy_points")
+        fov_points = occupancy_points
+
+    # sensor x y r c
     sensor_x, sensor_y = float(sensor_xy[0]), float(sensor_xy[1])
     sensor_r, sensor_c = world_to_grid(sensor_x, sensor_y, x_min, y_min, resolution)
     sensor_r = int(np.clip(sensor_r, 0, H - 1))
     sensor_c = int(np.clip(sensor_c, 0, W - 1))
 
-    occ_pts = np.asarray(points_xyz, dtype=np.float32).reshape(-1, 3)
-    occ_pts = occ_pts[np.isfinite(occ_pts).all(axis=1)]
-    if len(occ_pts) > 0:
-        rows, cols, in_bounds = points_to_bev_indices(occ_pts, x_min, y_min, resolution, H, W)
-        rows = rows[in_bounds]
-        cols = cols[in_bounds]
-        occupied[rows, cols] = True
-        occ_pts = occ_pts[in_bounds]
+    # 4. Handle angle ranges and increments
+    observed_angles = np.arctan2(fov_points[:, 1] - sensor_y, fov_points[:, 0] - sensor_x)
 
-    fov_source = occ_pts if fov_points_xyz is None else np.asarray(fov_points_xyz, dtype=np.float32)
-    occluder_source = (
-        fov_source
-        if occluder_points_xyz is None
-        else np.asarray(occluder_points_xyz, dtype=np.float32)
-    )
-
-    if fov_points_xyz is None:
-        fov_pts = occ_pts
-    else:
-        fov_pts = fov_source.reshape(-1, 3)
-        fov_pts = fov_pts[np.isfinite(fov_pts).all(axis=1)]
-        if len(fov_pts) > 0:
-            _, _, fov_in_bounds = points_to_bev_indices(fov_pts, x_min, y_min, resolution, H, W)
-            fov_pts = fov_pts[fov_in_bounds]
-
-    if len(occ_pts) == 0 and len(fov_pts) == 0:
-        known = occupied | visible_free
-        return occupied, visible_free, known
-
-    if len(fov_pts) == 0:
-        fov_pts = occ_pts
-
-    observed_angles = np.arctan2(fov_pts[:, 1] - sensor_y, fov_pts[:, 0] - sensor_x)
-    if angle_min is None:
-        angle_min = float(np.min(observed_angles))
-    else:
-        angle_min = float(angle_min)
-    if angle_max is None:
-        angle_max = float(np.max(observed_angles))
-    else:
-        angle_max = float(angle_max)
+    angle_min = float(np.min(observed_angles)) if angle_min is None else float(angle_min)
+    angle_max = float(np.max(observed_angles)) if angle_max is None else float(angle_max)
 
     if angle_max < angle_min:
         angle_min, angle_max = angle_max, angle_min
 
     if angle_increment is None:
-        corners = np.asarray(
-            [
-                [x_min, y_min],
-                [x_min, y_max],
-                [x_max, y_min],
-                [x_max, y_max],
-            ],
-            dtype=np.float32,
-        )
+        corners = np.asarray([[x_min, y_min],
+                              [x_min, y_max],
+                              [x_max, y_min],
+                              [x_max, y_max],],dtype=np.float32,)
         max_range = float(np.max(np.linalg.norm(corners - np.asarray([sensor_x, sensor_y], dtype=np.float32), axis=1)))
         angle_increment = float(np.arctan2(resolution, max(max_range, resolution)))
     else:
@@ -853,145 +967,108 @@ def raytrace_visibility_from_points(
     hit_ranges = np.full((num_bins,), np.inf, dtype=np.float32)
     hit_points = np.full((num_bins, 2), np.nan, dtype=np.float32)
 
+    # 5. Build visibility hit_pts
     if bridge_occluder_neighbors and occluder_source.ndim == 3:
+        t0 = time.perf_counter()
         occluder_mask = rasterize_organized_occluders(
             occluder_source,
-            x_min=x_min,
-            x_max=x_max,
-            y_min=y_min,
-            y_max=y_max,
-            resolution=resolution,
-            H=H,
-            W=W,
+            grid=grid,
             max_neighbor_distance_m=max_occluder_neighbor_distance_m,
         )
         occluder_rows, occluder_cols = np.nonzero(occluder_mask)
+        t1 = time.perf_counter()
+        print(f"raytrace: rasterize_organized_occluders: {(t1 - t0) * 1000:.2f} ms")
         hit_pts = _grid_centers_from_indices(occluder_rows, occluder_cols, x_min, y_min, resolution)
     else:
         hit_pts = occluder_source.reshape(-1, 3)
         hit_pts = hit_pts[np.isfinite(hit_pts).all(axis=1)]
         if len(hit_pts) > 0:
-            _, _, hit_in_bounds = points_to_bev_indices(hit_pts, x_min, y_min, resolution, H, W)
+            _, _, hit_in_bounds = points_to_bev_indices(hit_pts, grid)
             hit_pts = hit_pts[hit_in_bounds]
-
     if len(hit_pts) > 0:
-        x = hit_pts[:, 0]
-        y = hit_pts[:, 1]
-        r = np.sqrt((x - sensor_x) ** 2 + (y - sensor_y) ** 2)
-        a = np.arctan2(y - sensor_y, x - sensor_x)
+        x, y = hit_pts[:, 0], hit_pts[:, 1]
+        dx, dy = x - sensor_x, y - sensor_y
+        r = np.hypot(dx, dy)
+        a = np.arctan2(dy, dx)
 
-        valid = (
-            np.isfinite(r)
-            & np.isfinite(a)
-            & (r >= 0.05)
-            & (a >= angle_min)
-            & (a <= angle_max)
-        )
-
-        r = r[valid]
-        a = a[valid]
-        x = x[valid]
-        y = y[valid]
-
-        bin_idx = np.floor((a - angle_min) / angle_increment).astype(np.int32)
-        bin_idx = np.clip(bin_idx, 0, num_bins - 1)
-
-        for idx, rr, xx, yy in zip(bin_idx, r, x, y):
-            if rr < hit_ranges[idx]:
-                hit_ranges[idx] = rr
-                hit_points[idx] = [xx, yy]
-
-    def boundary_endpoint(angle):
-        dx = np.cos(angle)
-        dy = np.sin(angle)
-        candidates = []
-
-        if abs(dx) > 1e-8:
-            tx = (x_min - sensor_x) / dx
-            y_at_tx = sensor_y + tx * dy
-            if tx > 0.0 and y_min - 1e-6 <= y_at_tx <= y_max + 1e-6:
-                candidates.append(tx)
-
-            tx = (x_max - sensor_x) / dx
-            y_at_tx = sensor_y + tx * dy
-            if tx > 0.0 and y_min - 1e-6 <= y_at_tx <= y_max + 1e-6:
-                candidates.append(tx)
-
-        if abs(dy) > 1e-8:
-            ty = (y_min - sensor_y) / dy
-            x_at_ty = sensor_x + ty * dx
-            if ty > 0.0 and x_min - 1e-6 <= x_at_ty <= x_max + 1e-6:
-                candidates.append(ty)
-
-            ty = (y_max - sensor_y) / dy
-            x_at_ty = sensor_x + ty * dx
-            if ty > 0.0 and x_min - 1e-6 <= x_at_ty <= x_max + 1e-6:
-                candidates.append(ty)
-
-        if not candidates:
-            return sensor_x, sensor_y
-
-        t = min(candidates)
-        return sensor_x + t * dx, sensor_y + t * dy
-
-    def clamp_grid_endpoint(x, y):
-        row, col = world_to_grid(x, y, x_min, y_min, resolution)
-        row = int(np.clip(row, 0, H - 1))
-        col = int(np.clip(col, 0, W - 1))
-        return row, col
+        valid = (np.isfinite(r)) & (r >= 0.05) & (a >= angle_min) & (a <= angle_max)
+        r, a, x, y = r[valid], a[valid], x[valid], y[valid]
+        if len(r) > 0:
+            bin_idx = np.clip(((a - angle_min) / angle_increment).astype(np.int32), 0, num_bins - 1)
+            _find_min_bin_hits(bin_idx, r, x, y, hit_ranges, hit_points)
 
     angles = angle_min + np.arange(num_bins, dtype=np.float32) * angle_increment
-    beam_ranges = np.zeros((num_bins,), dtype=np.float32)
-    beam_hits = np.isfinite(hit_ranges)
-    for idx, angle in enumerate(angles):
-        if beam_hits[idx]:
-            end_x = float(hit_points[idx, 0])
-            end_y = float(hit_points[idx, 1])
-            beam_ranges[idx] = float(hit_ranges[idx])
-            include_endpoint = False
-        else:
-            end_x, end_y = boundary_endpoint(float(angle))
-            beam_ranges[idx] = float(np.hypot(end_x - sensor_x, end_y - sensor_y))
-            include_endpoint = True
-        end_r, end_c = clamp_grid_endpoint(end_x, end_y)
-        line_cells = bresenham_line(sensor_r, sensor_c, end_r, end_c)
-        ray_cells = line_cells if include_endpoint else line_cells[:-1]
+    cos_a, sin_a = np.cos(angles), np.sin(angles)
 
-        for rr, cc in ray_cells:
-            if 0 <= rr < H and 0 <= cc < W:
-                visible_free[rr, cc] = True
+    t2 = time.perf_counter()
+    print(f"raytrace: _find_min_bin_hits: {(t2 - t1) * 1000:.2f} ms")
+
+    # Vectorized boundary intersections
+    with np.errstate(divide='ignore', invalid='ignore'):
+        tx1 = np.where(np.abs(cos_a) > 1e-8, (x_min - sensor_x) / cos_a, np.nan)
+        tx2 = np.where(np.abs(cos_a) > 1e-8, (x_max - sensor_x) / cos_a, np.nan)
+        ty1 = np.where(np.abs(sin_a) > 1e-8, (y_min - sensor_y) / sin_a, np.nan)
+        ty2 = np.where(np.abs(sin_a) > 1e-8, (y_max - sensor_y) / sin_a, np.nan)
+
+    def valid_t(t, val, bound_min, bound_max):
+        return (t > 0.0) & (val >= bound_min - 1e-6) & (val <= bound_max + 1e-6)
+
+    t_candidates = np.stack([
+        np.where(valid_t(tx1, sensor_y + tx1 * sin_a, y_min, y_max), tx1, np.inf),
+        np.where(valid_t(tx2, sensor_y + tx2 * sin_a, y_min, y_max), tx2, np.inf),
+        np.where(valid_t(ty1, sensor_x + ty1 * cos_a, x_min, x_max), ty1, np.inf),
+        np.where(valid_t(ty2, sensor_x + ty2 * cos_a, x_min, x_max), ty2, np.inf),
+    ], axis=1)
+
+    t_boundary = np.min(t_candidates, axis=1)
+    boundary_x = sensor_x + t_boundary * cos_a
+    boundary_y = sensor_y + t_boundary * sin_a
+
+    has_hit = np.isfinite(hit_ranges)
+    final_x = np.where(has_hit, hit_points[:, 0], boundary_x)
+    final_y = np.where(has_hit, hit_points[:, 1], boundary_y)
+    final_ranges = np.where(has_hit, hit_ranges, np.hypot(final_x - sensor_x, final_y - sensor_y))
+
+    t3 = time.perf_counter()
+    print(f"raytrace: boundary intersections: {(t3 - t2) * 1000:.2f} ms")
+
+    # Single-pass OpenCV batch rasterization
+    wedge_mask = np.zeros((H, W), dtype=np.uint8)
 
     if fill_between_beams and num_bins > 1:
-        wedge_mask = np.zeros((H, W), dtype=np.uint8)
-        sensor_poly = np.asarray([sensor_c, sensor_r], dtype=np.int32)
-        for idx in range(num_bins - 1):
-            fill_range = float(min(beam_ranges[idx], beam_ranges[idx + 1]))
-            if not np.isfinite(fill_range) or fill_range <= 0.0:
-                continue
+        fill_ranges = np.minimum(final_ranges[:-1], final_ranges[1:])
+        valid_wedges = np.isfinite(fill_ranges) & (fill_ranges > 0.0)
 
-            end0_x = sensor_x + fill_range * np.cos(float(angles[idx]))
-            end0_y = sensor_y + fill_range * np.sin(float(angles[idx]))
-            end1_x = sensor_x + fill_range * np.cos(float(angles[idx + 1]))
-            end1_y = sensor_y + fill_range * np.sin(float(angles[idx + 1]))
-            end0_r, end0_c = clamp_grid_endpoint(end0_x, end0_y)
-            end1_r, end1_c = clamp_grid_endpoint(end1_x, end1_y)
+        e0_x = sensor_x + fill_ranges[valid_wedges] * cos_a[:-1][valid_wedges]
+        e0_y = sensor_y + fill_ranges[valid_wedges] * sin_a[:-1][valid_wedges]
+        e1_x = sensor_x + fill_ranges[valid_wedges] * cos_a[1:][valid_wedges]
+        e1_y = sensor_y + fill_ranges[valid_wedges] * sin_a[1:][valid_wedges]
 
-            poly = np.asarray(
-                [
-                    sensor_poly,
-                    [end0_c, end0_r],
-                    [end1_c, end1_r],
-                ],
-                dtype=np.int32,
-            )
-            cv2.fillConvexPoly(wedge_mask, poly, 1)
+        inv_res = 1.0 / resolution
+        e0_c = np.clip(((e0_x - x_min) * inv_res).astype(np.int32), 0, W - 1)
+        e0_r = np.clip(((e0_y - y_min) * inv_res).astype(np.int32), 0, H - 1)
+        e1_c = np.clip(((e1_x - x_min) * inv_res).astype(np.int32), 0, W - 1)
+        e1_r = np.clip(((e1_y - y_min) * inv_res).astype(np.int32), 0, H - 1)
 
-        visible_free |= wedge_mask.astype(bool)
+        num_valid = len(e0_c)
+        if num_valid > 0:
+            # Interleave endpoints into one single perimeter contour
+            contour = np.empty((2 * num_valid + 1, 2), dtype=np.int32)
+            contour[0] = [sensor_c, sensor_r]
+            contour[1::2, 0] = e0_c
+            contour[1::2, 1] = e0_r
+            contour[2::2, 0] = e1_c
+            contour[2::2, 1] = e1_r
 
-    visible_free[occupied] = False
-    known = occupied | visible_free
-    return occupied, visible_free, known
+            # Single draw call: zero overdraw
+            cv2.fillPoly(wedge_mask, [contour], 1)
 
+    visible_free = wedge_mask.astype(bool)
+    visible_free[occluder_mask] = False
+    known = occluder_mask | visible_free
+    t4 = time.perf_counter()
+    print(f"raytrace: fill_between_beams: {(t4 - t3) * 1000:.2f} ms")
+    return occluder_mask, visible_free, known
 
 def compute_esdf_from_occupancy(
     occupied_mask,
@@ -1106,7 +1183,7 @@ def pointcloud_to_esdf_pipeline(
     resolution=0.05,
     sensor_xy=(0.0, 0.0),
     robot_radius=0.25,
-    ground_alignment=True,
+    ground_alignment=False,
     ground_alignment_prior_normal=None,
     ground_alignment_smoothing=0.65,
     ground_candidate_min_forward=0.5,
@@ -1133,6 +1210,7 @@ def pointcloud_to_esdf_pipeline(
     Returns:
         dict containing all intermediate maps
     """
+    t0 = time.perf_counter()
     pts_robot_nominal = transform_points(points_xyz, R=R, t=t)
     sensor_position = np.zeros(3, dtype=np.float32) if t is None else np.asarray(t, dtype=np.float32)
     ground_info = {
@@ -1148,6 +1226,10 @@ def pointcloud_to_esdf_pipeline(
         "inlier_rmse_m": None,
     }
     pts_robot = pts_robot_nominal
+    t1 = time.perf_counter()
+    print("=============================================")
+    print(f"1. transform_points: {(t1 - t0) * 1000:.2f} ms")
+
     if ground_alignment:
         correction, ground_info = estimate_ground_plane_correction(
             pts_robot_nominal,
@@ -1168,6 +1250,8 @@ def pointcloud_to_esdf_pipeline(
             smoothing=ground_alignment_smoothing,
         )
         pts_robot = transform_points(pts_robot_nominal - sensor_position, R=correction, t=sensor_position)
+    t2 = time.perf_counter()
+    print(f"2. ground_alignment: {(t2 - t1) * 1000:.2f} ms")
 
     pts_filt, valid_mask = filter_points_by_height_and_roi(
         pts_robot,
@@ -1181,6 +1265,9 @@ def pointcloud_to_esdf_pipeline(
     )
     pts_occluder = pts_robot.astype(np.float32, copy=True)
     pts_occluder.reshape(-1, 3)[~valid_mask] = np.nan
+    t3 = time.perf_counter()
+    print(f"3. filter_points_by_height_and_roi: {(t3 - t2) * 1000:.2f} ms")
+
     occupied, visible_free, known = raytrace_visibility_from_points(
         pts_filt,
         x_min=x_min,
@@ -1195,10 +1282,17 @@ def pointcloud_to_esdf_pipeline(
         angle_max=visibility_angle_max,
         angle_increment=visibility_angle_increment,
     )
+    t4 = time.perf_counter()
+    print(f"4. raytrace_visibility_from_points: {(t4 - t3) * 1000:.2f} ms")
 
     esdf = compute_esdf_from_occupancy(occupied, known, resolution=resolution, signed=True)
+    t5 = time.perf_counter()
+    print(f"5. compute_esdf_from_occupancy: {(t5 - t4) * 1000:.2f} ms")
+
     clearance = inflate_obstacles_via_esdf(esdf, robot_radius=robot_radius)
     unknown = build_unknown_mask(known)
+    t6 = time.perf_counter()
+    print(f"6. inflate obstacle, build unknown mask: {(t6 - t5) * 1000:.2f} ms")
 
     return {
         "points_robot_nominal": pts_robot_nominal,

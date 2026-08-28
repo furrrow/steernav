@@ -5,6 +5,15 @@ import glob
 import os
 import matplotlib
 import matplotlib.pyplot as plt
+from PIL import Image
+
+def fig_to_image(fig: plt.Figure) -> Image.Image:
+    canvas = matplotlib.backends.backend_agg.FigureCanvasAgg(fig)
+    canvas.draw()
+    rgba = np.asarray(canvas.buffer_rgba())
+    image = Image.fromarray(rgba, mode="RGBA").convert("RGB")
+    plt.close(fig)
+    return image
 
 def save_side_by_side(original, pred_color, out_path, fps=20):
     """

@@ -508,7 +508,96 @@ def save_debug_figure(
     # Render the Matplotlib figure into an RGB NumPy array.
     fig.canvas.draw()
     image_rgb = np.asarray(fig.canvas.buffer_rgba())[:, :, :3].copy()
+    plt.close(fig)
+    return image_rgb
 
+def plot_esdf_surface(
+        depth: np.ndarray,
+        rgb: np.ndarray,
+        result: dict[str, np.ndarray],
+        idx: int,
+        args: argparse.Namespace,
+) -> np.ndarray:
+    extent = [args.x_min, args.x_max, args.y_min, args.y_max]
+    sensor_xy = (args.sensor_x, args.sensor_y)
+    filtered = result["points_filtered"]
+    esdf = result["esdf"]
+    depth_scale = finite_percentile_abs(depth, percentile=99.0)
+    esdf_scale = finite_percentile_abs(esdf, percentile=99.0)
+    ground_alignment = result.get("ground_alignment") if isinstance(result, dict) else None
+    alignment_text = ""
+    if isinstance(ground_alignment, dict) and ground_alignment.get("enabled"):
+        source = ground_alignment.get("normal_source", "unknown")
+        applied_tilt = ground_alignment.get("applied_tilt_deg")
+        if applied_tilt is None:
+            alignment_text = f" | ground align: {source}"
+        else:
+            alignment_text = f" | ground align: {source} {float(applied_tilt):.1f} deg"
+
+    fig, axes = plt.subplots(2, 3, figsize=(24, 12), constrained_layout=True)
+    fig.suptitle(
+        (
+            f"frame {idx} | "
+            f"filtered points: {filtered.shape[0]} | "
+            f"frame: {args.frame_preset} | res: {args.resolution:.2f} m"
+            f"{alignment_text}"
+        ),
+        fontsize=14,
+    )
+
+    ax = axes[0, 0]
+    ax.imshow(rgb)
+    ax.set_title("Egocentric RGB")
+    ax.axis("off")
+
+    ax = axes[0, 1]
+    if filtered.shape[0] > 0:
+        point_count = filtered.shape[0]
+        if point_count > 25000:
+            sample_idx = np.linspace(0, point_count - 1, 25000).astype(np.int32)
+            filtered_plot = filtered[sample_idx]
+        else:
+            filtered_plot = filtered
+        scatter = ax.scatter(
+            filtered_plot[:, 0],
+            filtered_plot[:, 1],
+            c=filtered_plot[:, 2],
+            s=1.0,
+            alpha=0.45,
+            cmap="viridis",
+            linewidths=0.0,
+        )
+        plt.colorbar(scatter, ax=ax, fraction=0.046, pad=0.04, label="height z (m)")
+    ax.scatter([sensor_xy[0]], [sensor_xy[1]], marker="x", s=36, c="red", linewidths=1.5)
+    ax.set_xlim(args.x_min, args.x_max)
+    ax.set_ylim(args.y_min, args.y_max)
+    ax.set_title("Filtered BEV Points")
+    ax.set_xlabel("x (m)")
+    ax.set_ylabel("y (m)")
+    ax.set_aspect("equal", adjustable="box")
+
+    plot_bool_map(axes[0, 2], result["occupied_mask"], extent, "Occupied", sensor_xy)
+
+    # somehow the depth y-axis are flipped...
+    plot_scalar_map(axes[1, 0], depth[::-1, :], extent, "Depth",
+                    sensor_xy, cmap="coolwarm", vmin=0, vmax=depth_scale, )
+
+    ax = axes[1, 1]
+    ax.imshow(semantic_bev_image(result["occupied_mask"], result["visible_free_mask"], result["unknown_mask"]),
+              origin="lower", extent=extent)
+    ax.scatter([sensor_xy[0]], [sensor_xy[1]], marker="x", s=36, c="yellow", linewidths=1.5)
+    ax.set_title("Known / Unknown Semantics")
+    ax.set_xlabel("x (m)")
+    ax.set_ylabel("y (m)")
+    ax.set_aspect("equal", adjustable="box")
+
+    plot_scalar_map(axes[1, 2], esdf, extent,"ESDF (m)",
+                    sensor_xy, cmap="coolwarm", vmin=-esdf_scale, vmax=esdf_scale,)
+
+    # Render the Matplotlib figure into an RGB NumPy array.
+    fig.canvas.draw()
+    image_rgb = np.asarray(fig.canvas.buffer_rgba())[:, :, :3].copy()
+    plt.close(fig)
     return image_rgb
 
 def build_points_input(points_map: np.ndarray, mask: np.ndarray) -> np.ndarray:
