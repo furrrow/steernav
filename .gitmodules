@@ -1,6 +1,3 @@
-[submodule "services/sam3"]
-	path = services/sam3
-	url = git@github.com:furrrow/sam3.git
 [submodule "services/OnlineVideoDepthAnything"]
 	path = services/OnlineVideoDepthAnything
 	url = git@github.com:furrrow/OnlineVideoDepthAnything.git
