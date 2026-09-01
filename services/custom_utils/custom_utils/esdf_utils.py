@@ -13,11 +13,12 @@ from typing import Any, Sequence
 
 import numpy as np
 from PIL import Image, ImageDraw
-
+from custom_utils.io_utils import overlay_path
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
 import matplotlib
 
-matplotlib.use("Agg")
+# matplotlib.use("Agg")
+matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -511,10 +512,14 @@ def save_debug_figure(
     plt.close(fig)
     return image_rgb
 
-def plot_esdf_surface(
+def visualize_path_esdf(
         depth: np.ndarray,
         rgb: np.ndarray,
         result: dict[str, np.ndarray],
+        cam_matrix: np.ndarray,
+        T_cam_from_base: np.ndarray,
+        before_path:np.ndarray,
+        after_path :np.ndarray,
         idx: int,
         args: argparse.Namespace,
 ) -> np.ndarray:
@@ -534,7 +539,7 @@ def plot_esdf_surface(
         else:
             alignment_text = f" | ground align: {source} {float(applied_tilt):.1f} deg"
 
-    fig, axes = plt.subplots(2, 3, figsize=(24, 12), constrained_layout=True)
+    fig, axes = plt.subplots(2, 2, figsize=(24, 12), constrained_layout=True)
     fig.suptitle(
         (
             f"frame {idx} | "
@@ -544,56 +549,27 @@ def plot_esdf_surface(
         ),
         fontsize=14,
     )
-
+    # 1. plot camera view + paths
     ax = axes[0, 0]
-    ax.imshow(rgb)
-    ax.set_title("Egocentric RGB")
-    ax.axis("off")
+    trajectories = np.concatenate((np.expand_dims(before_path, 0), np.expand_dims(after_path, 0)))
+    overlay = overlay_path(trajectories=trajectories, img=rgb, cam_matrix=cam_matrix, T_cam_from_base=T_cam_from_base)
+    ax.imshow(overlay)
+    ax.set_title("Egocentric with paths")
+    # ax.axis("off")
 
-    ax = axes[0, 1]
-    if filtered.shape[0] > 0:
-        point_count = filtered.shape[0]
-        if point_count > 25000:
-            sample_idx = np.linspace(0, point_count - 1, 25000).astype(np.int32)
-            filtered_plot = filtered[sample_idx]
-        else:
-            filtered_plot = filtered
-        scatter = ax.scatter(
-            filtered_plot[:, 0],
-            filtered_plot[:, 1],
-            c=filtered_plot[:, 2],
-            s=1.0,
-            alpha=0.45,
-            cmap="viridis",
-            linewidths=0.0,
-        )
-        plt.colorbar(scatter, ax=ax, fraction=0.046, pad=0.04, label="height z (m)")
-    ax.scatter([sensor_xy[0]], [sensor_xy[1]], marker="x", s=36, c="red", linewidths=1.5)
-    ax.set_xlim(args.x_min, args.x_max)
-    ax.set_ylim(args.y_min, args.y_max)
-    ax.set_title("Filtered BEV Points")
-    ax.set_xlabel("x (m)")
-    ax.set_ylabel("y (m)")
-    ax.set_aspect("equal", adjustable="box")
+    # 2. occupied top-down view
+    plot_bool_map(axes[0, 1], result["occupied_mask"], extent, "Occupied", sensor_xy)
 
-    plot_bool_map(axes[0, 2], result["occupied_mask"], extent, "Occupied", sensor_xy)
-
-    # somehow the depth y-axis are flipped...
+    # 3. Depth map in camera view
+    # the depth y-axis are flipped
     plot_scalar_map(axes[1, 0], depth[::-1, :], extent, "Depth",
                     sensor_xy, cmap="coolwarm", vmin=0, vmax=depth_scale, )
 
-    ax = axes[1, 1]
-    ax.imshow(semantic_bev_image(result["occupied_mask"], result["visible_free_mask"], result["unknown_mask"]),
-              origin="lower", extent=extent)
-    ax.scatter([sensor_xy[0]], [sensor_xy[1]], marker="x", s=36, c="yellow", linewidths=1.5)
-    ax.set_title("Known / Unknown Semantics")
-    ax.set_xlabel("x (m)")
-    ax.set_ylabel("y (m)")
-    ax.set_aspect("equal", adjustable="box")
-
-    plot_scalar_map(axes[1, 2], esdf, extent,"ESDF (m)",
+    # 4. ESDF + paths
+    plot_scalar_map(axes[1, 1], esdf, extent,"ESDF (m)",
                     sensor_xy, cmap="coolwarm", vmin=-esdf_scale, vmax=esdf_scale,)
-
+    axes[1, 1].plot(before_path[:, 0], before_path[:, 1], color="red", linewidth=2.2)
+    axes[1, 1].plot(after_path[:, 0], after_path[:, 1], color="green", linewidth=2.2)
     # Render the Matplotlib figure into an RGB NumPy array.
     fig.canvas.draw()
     image_rgb = np.asarray(fig.canvas.buffer_rgba())[:, :, :3].copy()
@@ -605,7 +581,6 @@ def build_points_input(points_map: np.ndarray, mask: np.ndarray) -> np.ndarray:
     invalid = ~mask.astype(bool)
     points_input[invalid] = np.nan
     return points_input
-
 
 def output_path_for_sample(pointcloud_path: Path, output_dir: Path) -> Path:
     clip_id = pointcloud_path.parents[1].name

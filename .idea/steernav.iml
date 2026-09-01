@@ -6,9 +6,8 @@
       <excludeFolder url="file://$MODULE_DIR$/.venv" />
     </content>
     <orderEntry type="sourceFolder" forTests="false" />
-    <orderEntry type="module" module-name="sam3" exported="" />
+    <orderEntry type="module" module-name="moge" exported="" />
     <orderEntry type="module" module-name="custom_utils" exported="" />
-    <orderEntry type="module" module-name="ptc-depth" exported="" />
     <orderEntry type="module" module-name="OnlineVideoDepthAnything" exported="" />
     <orderEntry type="jdk" jdkName="uv (steernav)" jdkType="Python SDK" />
   </component>

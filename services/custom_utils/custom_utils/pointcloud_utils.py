@@ -780,7 +780,7 @@ def rasterize_organized_occluders(
         occluder[rows[in_bounds], cols[in_bounds]] = True
         return occluder
 
-    t1 = time.perf_counter()
+    # t1 = time.perf_counter()
     # print(f"initialize: {(t1 - t0) * 1000:.2f} ms")
 
     finite = np.isfinite(pts).all(axis=-1)
@@ -800,7 +800,7 @@ def rasterize_organized_occluders(
     rows = np.zeros(pts.shape[:2], dtype=np.int32)
     cols = np.zeros(pts.shape[:2], dtype=np.int32)
 
-    t2 = time.perf_counter()
+    # t2 = time.perf_counter()
     # print(f"finite/roi: {(t2 - t1) * 1000:.2f} ms")
 
     rows[roi] = np.clip(np.floor((y_pts[roi] - grid.y_min) * inv_res), 0, H - 1).astype(np.int32)
@@ -812,10 +812,10 @@ def rasterize_organized_occluders(
 
     occluder[rows[roi], cols[roi],] = 1
     # Bridge small gaps
-    kernel = np.ones((20, 20), dtype=np.uint8)
+    kernel = np.ones((10, 10), dtype=np.uint8)
     occluder = cv2.morphologyEx(occluder, cv2.MORPH_CLOSE, kernel,)
-    t4 = time.perf_counter()
-    print(f"rasterize: new occluder using cv2.morphologyEx: {(t4 - t2) * 1000:.2f} ms")
+    # t4 = time.perf_counter()
+    # print(f"rasterize: new occluder using cv2.morphologyEx: {(t4 - t2) * 1000:.2f} ms")
     return occluder.astype(bool)
     # chatgpt portion: ======================================================
 
@@ -976,8 +976,8 @@ def raytrace_visibility_from_points(
             max_neighbor_distance_m=max_occluder_neighbor_distance_m,
         )
         occluder_rows, occluder_cols = np.nonzero(occluder_mask)
-        t1 = time.perf_counter()
-        print(f"raytrace: rasterize_organized_occluders: {(t1 - t0) * 1000:.2f} ms")
+        # t1 = time.perf_counter()
+        # print(f"raytrace: rasterize_organized_occluders: {(t1 - t0) * 1000:.2f} ms")
         hit_pts = _grid_centers_from_indices(occluder_rows, occluder_cols, x_min, y_min, resolution)
     else:
         hit_pts = occluder_source.reshape(-1, 3)
@@ -1000,8 +1000,8 @@ def raytrace_visibility_from_points(
     angles = angle_min + np.arange(num_bins, dtype=np.float32) * angle_increment
     cos_a, sin_a = np.cos(angles), np.sin(angles)
 
-    t2 = time.perf_counter()
-    print(f"raytrace: _find_min_bin_hits: {(t2 - t1) * 1000:.2f} ms")
+    # t2 = time.perf_counter()
+    # print(f"raytrace: _find_min_bin_hits: {(t2 - t1) * 1000:.2f} ms")
 
     # Vectorized boundary intersections
     with np.errstate(divide='ignore', invalid='ignore'):
@@ -1029,8 +1029,8 @@ def raytrace_visibility_from_points(
     final_y = np.where(has_hit, hit_points[:, 1], boundary_y)
     final_ranges = np.where(has_hit, hit_ranges, np.hypot(final_x - sensor_x, final_y - sensor_y))
 
-    t3 = time.perf_counter()
-    print(f"raytrace: boundary intersections: {(t3 - t2) * 1000:.2f} ms")
+    # t3 = time.perf_counter()
+    # print(f"raytrace: boundary intersections: {(t3 - t2) * 1000:.2f} ms")
 
     # Single-pass OpenCV batch rasterization
     wedge_mask = np.zeros((H, W), dtype=np.uint8)
@@ -1066,8 +1066,8 @@ def raytrace_visibility_from_points(
     visible_free = wedge_mask.astype(bool)
     visible_free[occluder_mask] = False
     known = occluder_mask | visible_free
-    t4 = time.perf_counter()
-    print(f"raytrace: fill_between_beams: {(t4 - t3) * 1000:.2f} ms")
+    # t4 = time.perf_counter()
+    # print(f"raytrace: fill_between_beams: {(t4 - t3) * 1000:.2f} ms")
     return occluder_mask, visible_free, known
 
 def compute_esdf_from_occupancy(
@@ -1210,7 +1210,7 @@ def pointcloud_to_esdf_pipeline(
     Returns:
         dict containing all intermediate maps
     """
-    t0 = time.perf_counter()
+    # t0 = time.perf_counter()
     pts_robot_nominal = transform_points(points_xyz, R=R, t=t)
     sensor_position = np.zeros(3, dtype=np.float32) if t is None else np.asarray(t, dtype=np.float32)
     ground_info = {
@@ -1226,9 +1226,8 @@ def pointcloud_to_esdf_pipeline(
         "inlier_rmse_m": None,
     }
     pts_robot = pts_robot_nominal
-    t1 = time.perf_counter()
-    print("=============================================")
-    print(f"1. transform_points: {(t1 - t0) * 1000:.2f} ms")
+    # t1 = time.perf_counter()
+    # print(f"1. transform_points: {(t1 - t0) * 1000:.2f} ms")
 
     if ground_alignment:
         correction, ground_info = estimate_ground_plane_correction(
@@ -1250,8 +1249,8 @@ def pointcloud_to_esdf_pipeline(
             smoothing=ground_alignment_smoothing,
         )
         pts_robot = transform_points(pts_robot_nominal - sensor_position, R=correction, t=sensor_position)
-    t2 = time.perf_counter()
-    print(f"2. ground_alignment: {(t2 - t1) * 1000:.2f} ms")
+    # t2 = time.perf_counter()
+    # print(f"2. ground_alignment: {(t2 - t1) * 1000:.2f} ms")
 
     pts_filt, valid_mask = filter_points_by_height_and_roi(
         pts_robot,
@@ -1265,8 +1264,8 @@ def pointcloud_to_esdf_pipeline(
     )
     pts_occluder = pts_robot.astype(np.float32, copy=True)
     pts_occluder.reshape(-1, 3)[~valid_mask] = np.nan
-    t3 = time.perf_counter()
-    print(f"3. filter_points_by_height_and_roi: {(t3 - t2) * 1000:.2f} ms")
+    # t3 = time.perf_counter()
+    # print(f"3. filter_points_by_height_and_roi: {(t3 - t2) * 1000:.2f} ms")
 
     occupied, visible_free, known = raytrace_visibility_from_points(
         pts_filt,
@@ -1282,17 +1281,17 @@ def pointcloud_to_esdf_pipeline(
         angle_max=visibility_angle_max,
         angle_increment=visibility_angle_increment,
     )
-    t4 = time.perf_counter()
-    print(f"4. raytrace_visibility_from_points: {(t4 - t3) * 1000:.2f} ms")
+    # t4 = time.perf_counter()
+    # print(f"4. raytrace_visibility_from_points: {(t4 - t3) * 1000:.2f} ms")
 
     esdf = compute_esdf_from_occupancy(occupied, known, resolution=resolution, signed=True)
-    t5 = time.perf_counter()
-    print(f"5. compute_esdf_from_occupancy: {(t5 - t4) * 1000:.2f} ms")
+    # t5 = time.perf_counter()
+    # print(f"5. compute_esdf_from_occupancy: {(t5 - t4) * 1000:.2f} ms")
 
     clearance = inflate_obstacles_via_esdf(esdf, robot_radius=robot_radius)
     unknown = build_unknown_mask(known)
-    t6 = time.perf_counter()
-    print(f"6. inflate obstacle, build unknown mask: {(t6 - t5) * 1000:.2f} ms")
+    # t6 = time.perf_counter()
+    # print(f"6. inflate obstacle, build unknown mask: {(t6 - t5) * 1000:.2f} ms")
 
     return {
         "points_robot_nominal": pts_robot_nominal,

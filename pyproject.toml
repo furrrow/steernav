@@ -6,10 +6,8 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "flash-attn",
-    "sam3",
     "OnlineVideoDepthAnything",
-    "Depth-Anything-V2",
-    "ptc-depth",
+    "moge",
     "tqdm>=4.70.0",
     "ipykernel>=7.3.0",
     "transformers>=5.15.0",
@@ -22,10 +20,8 @@ dependencies = [
 where = ["src"] # Tells setuptools where to find steernav source code
 
 [tool.uv.sources]
-sam3 = { workspace = true }
 OnlineVideoDepthAnything = { workspace = true }
-Depth-Anything-V2 = { workspace = true }
-ptc-depth = { workspace = true }
+moge = { workspace = true }
 custom_utils = { workspace = true }
 flash-attn = { index = "astral-cu128" }
 
