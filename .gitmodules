@@ -1,12 +1,6 @@
 [submodule "services/OnlineVideoDepthAnything"]
 	path = services/OnlineVideoDepthAnything
 	url = git@github.com:furrrow/OnlineVideoDepthAnything.git
-[submodule "services/ptc-depth"]
-	path = services/ptc-depth
-	url = git@github.com:furrrow/ptc-depth.git
-[submodule "services/Depth-Anything-V2"]
-	path = services/Depth-Anything-V2
-	url = git@github.com:furrrow/Depth-Anything-V2.git
 [submodule "services/MoGe"]
 	path = services/MoGe
 	url = git@github.com:furrrow/MoGe.git
