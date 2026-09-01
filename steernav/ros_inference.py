@@ -43,7 +43,7 @@ class SteeringNode(Node):
 
         # CONSTANTS
         robot_name = 'ghost'
-        parent_dir = "/home/jim/Projects"
+        parent_dir = "/home/jim/Projects/steernav"
         # parent_dir = "/workspace"
         DEPLOY_CONFIG_PATH = f"{parent_dir}/steernav/config/deployment.yaml"
         MODEL_CONFIG_PATH = "config/models.yaml"
@@ -63,9 +63,10 @@ class SteeringNode(Node):
 
         # ROS Topics
         IMAGE_TOPIC = robot_config['image_topic']
-        print(f"IMAGE_TOPIC: {IMAGE_TOPIC}")
-        POLICY_WAYPOINT_TOPIC = robot_config['policy_waypoint']
-        STEERED_WAYPOINT_TOPIC = robot_config['steered_waypoint']
+        self.compressed_img_topic = True if "compressed" in IMAGE_TOPIC else False
+        print(f"IMAGE_TOPIC: {IMAGE_TOPIC} compressed_img_topic: {self.compressed_img_topic}")
+        POLICY_PATH_TOPIC = robot_config['policy_path_topic']
+        STEERED_WAYPOINT_TOPIC = robot_config['steered_waypoint_topic']
         SAMPLED_ACTIONS_TOPIC = robot_config['sampled_actions_topic']
         REACHED_GOAL_TOPIC = robot_config['reached_goal_topic']
         OVERLAY_TOPIC = robot_config['overlay_topic']
@@ -84,13 +85,14 @@ class SteeringNode(Node):
         self.depth_model = MoGeModel.from_pretrained(model_name).to(self.device).eval()
 
         # ROS 2 Topics
+        msg_type = CompressedImage if self.compressed_img_topic else Image
         self.image_sub = self.create_subscription(
-            CompressedImage, IMAGE_TOPIC, self.img_callback_obs,
+            msg_type, IMAGE_TOPIC, self.img_callback_obs,
             qos_profile=QoSProfile(reliability=QoSReliabilityPolicy.RELIABLE,
                                    history=QoSHistoryPolicy.KEEP_LAST,
                                    depth=10))
         self.policy_waypoint_sub = self.create_subscription(
-            Path, POLICY_WAYPOINT_TOPIC, self.waypoint_callback_obs,
+            Path, POLICY_PATH_TOPIC, self.waypoint_callback_obs,
             qos_profile=QoSProfile(reliability=QoSReliabilityPolicy.RELIABLE,
                                    history=QoSHistoryPolicy.KEEP_LAST,
                                    depth=10))
@@ -122,9 +124,12 @@ class SteeringNode(Node):
 
     def img_callback_obs(self, msg: Image):
         self.get_logger().info("Reached Image callback!")
+        if self.compressed_img_topic:
+            self.obs_img = self.br.compressed_imgmsg_to_cv2(msg)
+        else:
+            self.obs_img = self.br.imgmsg_to_cv2(msg)
         # Original camera timestamp
         self.obs_img_timestamp = msg.header.stamp
-        self.obs_img = self.br.compressed_imgmsg_to_cv2(msg)
         self.obs_img = PILImage.fromarray(cv2.cvtColor(self.obs_img, cv2.COLOR_BGR2RGB))
         if self.obs_img.size != self.shrink_img_size:
             self.obs_img = self.obs_img.resize(self.shrink_img_size)
@@ -158,15 +163,13 @@ class SteeringNode(Node):
         if len(self.image_queue) == 0:
             self.get_logger().warn("Steering Node: image_queue empty!")
             return 0
-        timestamp_diff = np.array(self.image_timestamp_queue.sec) + np.array(self.image_timestamp_queue.nanosec) * 1e-9
-        timestamp_diff = timestamp_diff - (target_stamp.sec + target_stamp.nanosec * 1e-9)
-        self.get_logger().info(f"target_stamp {target_stamp}")
-        self.get_logger().info(f"self.image_timestamp_queue {self.image_timestamp_queue}")
-        self.get_logger().info(f"timestamp_diff {timestamp_diff}")
+        timestamps = np.array([t.sec + (t.nanosec * 1e-9) for t in self.image_timestamp_queue])
+        timestamp_diff = timestamps - (target_stamp.sec + target_stamp.nanosec * 1e-9)
+        # self.get_logger().info(f"target_stamp {target_stamp}")
+        # self.get_logger().info(f"self.image_timestamp_queue {self.image_timestamp_queue}")
+        # self.get_logger().info(f"timestamp_diff {timestamp_diff}")
         closest_idx = np.argmin(np.abs(timestamp_diff))
         return closest_idx
-
-
 
     def run_steering_loop(self, args):
         chosen_waypoint = np.zeros(2)
@@ -174,9 +177,9 @@ class SteeringNode(Node):
             latest_waypoint_timestamp = self.waypoint_timestamp_queue[-1]
             last_waypoint = self.waypoint_queue[-1]
             closest_idx = self.find_closest_stamp(latest_waypoint_timestamp)
-            self.get_logger().info(f"closest_idx {closest_idx}")
-            closest_img, closest_stamp = self.image_queue[closest_idx], self.image_timestamp_queue[closest_idx]
-            self.get_logger().info(f"closest_stamp {closest_stamp} to latest_waypoint_timestamp {latest_waypoint_timestamp}")
+            closest_stamp = self.image_timestamp_queue[closest_idx]
+            sec_diff = closest_stamp.sec - latest_waypoint_timestamp.sec + (closest_stamp.nanosec - latest_waypoint_timestamp.nanosec) * 1e-9
+            self.get_logger().info(f"closest_idx {closest_idx}, closest_stamp - latest_waypoint_timestamp: {sec_diff:.6f} sec")
 
             obs_image = np.array(self.image_queue[closest_idx])
             input_image = torch.from_numpy(obs_image).to(self.device).permute(2, 0, 1).float().div_(255.0)
@@ -191,8 +194,11 @@ class SteeringNode(Node):
 
             esdf_result, init_path_xy, opt_path_xy = update_trajectories(
                 args, points_input, estimated_cam_matrix, vla_path, time_session=False)
-
-            original_frame = obs_image.resize(self.original_img_size)
+            if self.original_img_size != self.shrink_img_size:
+                original_frame = cv2.resize(obs_image, dsize=self.original_img_size,
+                                            interpolation=cv2.INTER_CUBIC)
+            else:
+                original_frame = obs_image
             esdf_surface = visualize_path_esdf(depth=depth, rgb=original_frame,
                                                result=esdf_result, cam_matrix=self.cam_matrix,
                                                T_cam_from_base=self.T_cam_from_base,

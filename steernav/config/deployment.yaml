@@ -12,9 +12,9 @@ turtle:
 ghost:
   max_v: 0.2 # m/s
   max_w: 0.3 # rad/s
-  image_topic: "/camera/camera/color/image_raw/compressed"
-#  image_topic: "/camera/camera/color/image_raw"
-  policy_waypoint_topic: "/ghost/policy_waypoint"
+#  image_topic: "/camera/camera/color/image_raw/compressed"
+  image_topic: "/camera/camera/color/image_raw"
+  policy_path_topic: "/ghost/policy_path"
   steered_waypoint_topic: "/ghost/steered_waypoint"
   reached_goal_topic: "/ghost/topoplan/reached_goal"
   sampled_actions_topic: "/ghost/sampled_actions"

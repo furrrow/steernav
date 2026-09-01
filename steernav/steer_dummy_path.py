@@ -349,7 +349,10 @@ def update_trajectories(args: Namespace,
                         points_input: ndarray,
                         intrinsics: ndarray,
                         input_trajectory: ndarray,
-                        time_session: bool) -> tuple[
+                        time_session: bool,
+                        n_iter: int = 5,
+                        lr: float = 0.1,
+                        smooth_weight: float = 0.2,) -> tuple[
     dict[str, Tensor], ndarray, ndarray]:
     t0 = time.perf_counter()
     rotation, translation = camera_to_base_transform(camera_height=args.camera_height)
@@ -371,11 +374,10 @@ def update_trajectories(args: Namespace,
         print(f"build + valid_mesh {(t2 - t1) * 1000:.1f} ms")
     init_path_xy = constrain_xy_to_esdf(input_trajectory[:, :2], valid_mesh)  # (N, 2)
     # Optimize path using ESDF gradients
-    n_iter = 10
     # numpy version, n_iter=5, 1.3ms
     opt_path_xy = adam_update_numpy(path_xy=init_path_xy, valid_mesh=valid_mesh,
                                     esdf_height_scale=args.esdf_height_scale,
-                                    lr=0.2, smooth_weight=0.05,
+                                    lr=lr, smooth_weight=smooth_weight,
                                     iterations=n_iter, )
     if time_session:
         t3 = time.perf_counter()

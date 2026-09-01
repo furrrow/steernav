@@ -3,24 +3,22 @@ name = "steernav" # workspace root
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.10"
 dependencies = [
     "flash-attn",
-    "OnlineVideoDepthAnything",
     "moge",
-    "tqdm>=4.70.0",
-    "ipykernel>=7.3.0",
-    "transformers>=5.15.0",
-    "scipy-stubs~=1.17.1",
+    "tqdm",
+    "numpy<2",
+    "transformers",
+    "scipy-stubs",
     "custom_utils",
-    "scipy>=1.17.1",
+    "scipy",
 ]
 
 [tool.setuptools.packages.find]
 where = ["src"] # Tells setuptools where to find steernav source code
 
 [tool.uv.sources]
-OnlineVideoDepthAnything = { workspace = true }
 moge = { workspace = true }
 custom_utils = { workspace = true }
 flash-attn = { index = "astral-cu128" }

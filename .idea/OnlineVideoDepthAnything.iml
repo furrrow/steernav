@@ -7,6 +7,5 @@
     </content>
     <orderEntry type="sourceFolder" forTests="false" />
     <orderEntry type="module" module-name="custom_utils" exported="" />
-    <orderEntry type="jdk" jdkName="uv (steernav)" jdkType="Python SDK" />
   </component>
 </module>
