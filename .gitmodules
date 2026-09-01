@@ -4,3 +4,4 @@
 [submodule "services/MoGe"]
 	path = services/MoGe
 	url = git@github.com:furrrow/MoGe.git
+	branch = custom
