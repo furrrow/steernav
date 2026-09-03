@@ -5,14 +5,15 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "flash-attn",
     "moge",
     "tqdm",
     "numpy<2",
-    "transformers",
+    "transformers==4.49", # required for florence2
     "scipy-stubs",
     "custom_utils",
     "scipy",
+    "timm",
+    "einops",
 ]
 
 [tool.setuptools.packages.find]
@@ -21,7 +22,6 @@ where = ["src"] # Tells setuptools where to find steernav source code
 [tool.uv.sources]
 moge = { workspace = true }
 custom_utils = { workspace = true }
-flash-attn = { index = "astral-cu128" }
 
 [[tool.uv.index]]
 name = "pytorch-cu128"

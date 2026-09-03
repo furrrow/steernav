@@ -22,7 +22,7 @@ from nav_msgs.msg import Path
 from rclpy.qos import QoSProfile
 from rclpy.qos import QoSReliabilityPolicy, QoSHistoryPolicy
 
-from custom_utils.esdf_utils import visualize_path_esdf
+from custom_utils.esdf_utils import visualize_path_esdf, debug_visualize
 from custom_utils.io_utils import load_calibration
 
 import matplotlib
@@ -47,7 +47,7 @@ class SteeringNode(Node):
         # parent_dir = "/workspace"
         DEPLOY_CONFIG_PATH = f"{parent_dir}/steernav/config/deployment.yaml"
         MODEL_CONFIG_PATH = "config/models.yaml"
-        CAMERA_MATRIX_DIR = f"{parent_dir}/steernav/camera_matrix.json"
+        CAMERA_MATRIX_DIR = f"{parent_dir}/steernav/old_cam_matrix.json"
         self.distance_cutoff = 10
         with open(DEPLOY_CONFIG_PATH, "r") as f:
             deploy_config = yaml.safe_load(f)
@@ -130,7 +130,8 @@ class SteeringNode(Node):
             self.obs_img = self.br.imgmsg_to_cv2(msg)
         # Original camera timestamp
         self.obs_img_timestamp = msg.header.stamp
-        self.obs_img = PILImage.fromarray(cv2.cvtColor(self.obs_img, cv2.COLOR_BGR2RGB))
+        # self.obs_img = cv2.cvtColor(self.obs_img, cv2.COLOR_BGR2RGB)
+        self.obs_img = PILImage.fromarray(self.obs_img)
         if self.obs_img.size != self.shrink_img_size:
             self.obs_img = self.obs_img.resize(self.shrink_img_size)
             print(f"resizing image from {self.obs_img.size} to {self.shrink_img_size}")
@@ -204,6 +205,11 @@ class SteeringNode(Node):
                                                T_cam_from_base=self.T_cam_from_base,
                                                before_path=init_path_xy, after_path=opt_path_xy,
                                                idx=0, args=args)
+            # esdf_surface = debug_visualize(depth=depth, rgb=original_frame,
+            #                                    result=esdf_result, cam_matrix=self.cam_matrix,
+            #                                    T_cam_from_base=self.T_cam_from_base,
+            #                                    before_path=init_path_xy, after_path=opt_path_xy,
+            #                                    idx=0, args=args)
             out_msg = self.br.cv2_to_imgmsg(np.array(esdf_surface), encoding="rgb8")
             self.trajectory_visual_pub.publish(out_msg)
             chosen_waypoint = opt_path_xy[self.waypoint_idx]
@@ -240,7 +246,7 @@ if __name__ == "__main__":
     parser.add_argument("--h-min", type=float, default=0.5, help="Minimum kept height in meters.")
     parser.add_argument("--h-max", type=float, default=1.5, help="Maximum kept height in meters.")
     parser.add_argument("--x-min", type=float, default=0.0, help="Minimum forward extent in meters.")
-    parser.add_argument("--x-max", type=float, default=20.0, help="Maximum forward extent in meters.")
+    parser.add_argument("--x-max", type=float, default=15.0, help="Maximum forward extent in meters.")
     parser.add_argument("--y-min", type=float, default=-5.0, help="Minimum lateral extent in meters.")
     parser.add_argument("--y-max", type=float, default=5.0, help="Maximum lateral extent in meters.")
     parser.add_argument("--resolution", type=float, default=0.10, help="Grid resolution in meters per cell.")

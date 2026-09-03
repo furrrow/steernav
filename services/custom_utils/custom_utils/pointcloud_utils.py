@@ -807,17 +807,18 @@ def rasterize_organized_occluders(
     cols[roi] = np.clip(np.floor((x_pts[roi] - grid.x_min) * inv_res), 0, W - 1).astype(np.int32)
     occluder[rows[roi], cols[roi]] = True
 
-    # chatgpt portion: ======================================================
+    # shortcut portion: ======================================================
     # Raw projected surface
 
     occluder[rows[roi], cols[roi],] = 1
     # Bridge small gaps
-    kernel = np.ones((10, 10), dtype=np.uint8)
+    kernel_size = int(max_neighbor_distance_m // grid.resolution) + 1
+    kernel = np.ones((kernel_size, kernel_size), dtype=np.uint8)
     occluder = cv2.morphologyEx(occluder, cv2.MORPH_CLOSE, kernel,)
     # t4 = time.perf_counter()
     # print(f"rasterize: new occluder using cv2.morphologyEx: {(t4 - t2) * 1000:.2f} ms")
     return occluder.astype(bool)
-    # chatgpt portion: ======================================================
+    # shortcut portion: ======================================================
 
     # Check horizontal and vertical neighbor pairs
     neighbor_slices = (
@@ -888,7 +889,7 @@ def raytrace_visibility_from_points(
     angle_max=None,
     angle_increment=None,
     fill_between_beams=True,
-    bridge_occluder_neighbors=True,
+    bridge_occluder_neighbors=False,
     max_occluder_neighbor_distance_m=0.5,
 ):
     """
@@ -967,24 +968,24 @@ def raytrace_visibility_from_points(
     hit_ranges = np.full((num_bins,), np.inf, dtype=np.float32)
     hit_points = np.full((num_bins, 2), np.nan, dtype=np.float32)
 
-    # 5. Build visibility hit_pts
+    # 5. bridge_occluder_neighbors buggy, results in false rays of  "free", default False.
     if bridge_occluder_neighbors and occluder_source.ndim == 3:
-        t0 = time.perf_counter()
         occluder_mask = rasterize_organized_occluders(
             occluder_source,
             grid=grid,
-            max_neighbor_distance_m=max_occluder_neighbor_distance_m,
+            max_neighbor_distance_m=max_occluder_neighbor_distance_m * 3,
         )
         occluder_rows, occluder_cols = np.nonzero(occluder_mask)
-        # t1 = time.perf_counter()
-        # print(f"raytrace: rasterize_organized_occluders: {(t1 - t0) * 1000:.2f} ms")
         hit_pts = _grid_centers_from_indices(occluder_rows, occluder_cols, x_min, y_min, resolution)
     else:
+        # Fallback: create occluder_mask from points in grid
+        occluder_mask = np.zeros((H, W), dtype=bool)
         hit_pts = occluder_source.reshape(-1, 3)
         hit_pts = hit_pts[np.isfinite(hit_pts).all(axis=1)]
         if len(hit_pts) > 0:
-            _, _, hit_in_bounds = points_to_bev_indices(hit_pts, grid)
+            hit_r, hit_c, hit_in_bounds = points_to_bev_indices(hit_pts, grid)
             hit_pts = hit_pts[hit_in_bounds]
+            occluder_mask[hit_r[hit_in_bounds], hit_c[hit_in_bounds]] = True
     if len(hit_pts) > 0:
         x, y = hit_pts[:, 0], hit_pts[:, 1]
         dx, dy = x - sensor_x, y - sensor_y
@@ -1045,6 +1046,7 @@ def raytrace_visibility_from_points(
         e1_y = sensor_y + fill_ranges[valid_wedges] * sin_a[1:][valid_wedges]
 
         inv_res = 1.0 / resolution
+        # FIX: Ensure column (X) maps to W-1 and row (Y) maps to H-1
         e0_c = np.clip(((e0_x - x_min) * inv_res).astype(np.int32), 0, W - 1)
         e0_r = np.clip(((e0_y - y_min) * inv_res).astype(np.int32), 0, H - 1)
         e1_c = np.clip(((e1_x - x_min) * inv_res).astype(np.int32), 0, W - 1)
@@ -1060,7 +1062,6 @@ def raytrace_visibility_from_points(
             contour[2::2, 0] = e1_c
             contour[2::2, 1] = e1_r
 
-            # Single draw call: zero overdraw
             cv2.fillPoly(wedge_mask, [contour], 1)
 
     visible_free = wedge_mask.astype(bool)

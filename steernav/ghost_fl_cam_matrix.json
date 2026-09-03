@@ -1,0 +1,31 @@
+{
+    "camera_name": "ar0234_front_left_optical_frame",
+    "image_width": 960,
+    "image_height": 540,
+    "distortion_model": "equidistant",
+    "distortion_coefficients": [
+        0.0705456,
+        0.0289759,
+        -0.0230741,
+        0.00746709
+    ],
+    "H_cam_bl": {
+        "roll" : 0,
+        "pitch": 0,
+        "yaw" : 0,
+        "x" : 0,
+        "y" : 0.058,
+        "z" : 0.55
+    },
+    "Intrinsics": {
+    "fx": 394.795,
+    "fy": 395.037,
+    "cx": 457.89,
+    "cy": 269.546
+  },
+    "camera_matrix": [
+    [394.795, 0.0, 457.89],
+    [0.0, 395.037, 269.546],
+    [0.0, 0.0, 1.0]
+    ]
+}

@@ -26,6 +26,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from custom_utils.pointcloud_utils import camera_to_base_transform, pointcloud_to_esdf_pipeline
+from matplotlib.colors import LinearSegmentedColormap
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -402,6 +403,34 @@ def plot_scalar_map(
     ax.set_aspect("equal", adjustable="box")
     plt.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
 
+def plot_scalar_map_flipped(
+    ax: plt.Axes,
+    values: np.ndarray,
+    extent: Sequence[float],
+    title: str,
+    sensor_xy: tuple[float, float],
+    cmap: str,
+    vmin: float | None = None,
+    vmax: float | None = None,
+) -> None:
+    image = ax.imshow(values.T, origin="lower", extent=extent, cmap=cmap, vmin=vmin, vmax=vmax)
+    ax.scatter([sensor_xy[1]], [sensor_xy[0]], marker="x", s=36, c="yellow", linewidths=1.5)
+    ax.set_title(title)
+    ax.set_ylabel("x (m)")
+    ax.set_xlabel("y (m)")
+    ax.set_aspect("equal", adjustable="box")
+    plt.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
+
+custom_cmap = LinearSegmentedColormap.from_list(
+    "esdf",
+    [
+        (0.00, "royalblue"),
+        (0.45, "lightblue"),
+        (0.50, "black"),       # zero
+        (0.55, "salmon"),
+        (1.00, "crimson"),
+    ],
+)
 
 def save_debug_figure(
     pointcloud_path: Path,
@@ -524,6 +553,7 @@ def visualize_path_esdf(
         args: argparse.Namespace,
 ) -> np.ndarray:
     extent = [args.x_min, args.x_max, args.y_min, args.y_max]
+    extent_flipped = [args.y_min, args.y_max, args.x_min, args.x_max]
     sensor_xy = (args.sensor_x, args.sensor_y)
     filtered = result["points_filtered"]
     esdf = result["esdf"]
@@ -539,7 +569,7 @@ def visualize_path_esdf(
         else:
             alignment_text = f" | ground align: {source} {float(applied_tilt):.1f} deg"
 
-    fig, axes = plt.subplots(2, 2, figsize=(24, 12), constrained_layout=True)
+    fig, axes = plt.subplots(2, 2, figsize=(12, 12))
     fig.suptitle(
         (
             f"frame {idx} | "
@@ -557,19 +587,150 @@ def visualize_path_esdf(
     ax.set_title("Egocentric with paths")
     # ax.axis("off")
 
-    # 2. occupied top-down view
-    plot_bool_map(axes[0, 1], result["occupied_mask"], extent, "Occupied", sensor_xy)
+    # ESDF + paths
+    plot_scalar_map_flipped(axes[0, 1], esdf, extent_flipped, "ESDF (m)",
+                            sensor_xy, cmap=custom_cmap, vmin=-esdf_scale, vmax=esdf_scale, )
+    # know that the x-axis is flipped , so that it goes from pos -> negative
+    axes[0, 1].invert_xaxis()
+    axes[0, 1].plot(before_path[:, 1], before_path[:, 0], color="red", linewidth=2.2)
+    axes[0, 1].plot(after_path[:, 1], after_path[:, 0], color="green", linewidth=2.2)
 
     # 3. Depth map in camera view
     # the depth y-axis are flipped
     plot_scalar_map(axes[1, 0], depth[::-1, :], extent, "Depth",
                     sensor_xy, cmap="coolwarm", vmin=0, vmax=depth_scale, )
 
+    # occupied / free / unknown mixed view:
+    ax = axes[1, 1]
+    ax.imshow(
+        semantic_bev_image(result["occupied_mask"], result["visible_free_mask"], result["unknown_mask"]).swapaxes(0, 1),
+        origin="lower", extent=extent_flipped)
+    # know that the x-axis is flipped , so that it goes from pos -> negative
+    ax.invert_xaxis()
+    ax.scatter([sensor_xy[1]], [sensor_xy[0]], marker="x", s=36, c="yellow", linewidths=1.5)
+    ax.set_title("Red:occupied, Grey:unknown")
+    ax.set_xlabel("y (m)")
+    ax.set_ylabel("x (m)")
+    ax.set_aspect("equal", adjustable="box")
+    # Render the Matplotlib figure into an RGB NumPy array.
+    fig.canvas.draw()
+    image_rgb = np.asarray(fig.canvas.buffer_rgba())[:, :, :3].copy()
+    plt.close(fig)
+    return image_rgb
+
+def debug_visualize(
+        depth: np.ndarray,
+        rgb: np.ndarray,
+        result: dict[str, np.ndarray],
+        cam_matrix: np.ndarray,
+        T_cam_from_base: np.ndarray,
+        before_path:np.ndarray,
+        after_path :np.ndarray,
+        idx: int,
+        args: argparse.Namespace,
+) -> np.ndarray:
+    # see save_debug_figure() in VLADataGeneration/tests/esdf-test.py
+    extent = [args.x_min, args.x_max, args.y_min, args.y_max]
+    sensor_xy = (args.sensor_x, args.sensor_y)
+    filtered = result["points_filtered"]
+    esdf = result["esdf"]
+    clearance = result["clearance"]
+    depth_scale = finite_percentile_abs(depth, percentile=99.0)
+    esdf_scale = finite_percentile_abs(esdf, percentile=99.0)
+    clearance_scale = finite_percentile_abs(clearance, percentile=99.0)
+    ground_alignment = result.get("ground_alignment") if isinstance(result, dict) else None
+    alignment_text = ""
+    if isinstance(ground_alignment, dict) and ground_alignment.get("enabled"):
+        source = ground_alignment.get("normal_source", "unknown")
+        applied_tilt = ground_alignment.get("applied_tilt_deg")
+        if applied_tilt is None:
+            alignment_text = f" | ground align: {source}"
+        else:
+            alignment_text = f" | ground align: {source} {float(applied_tilt):.1f} deg"
+
+    fig, axes = plt.subplots(2, 4, figsize=(24, 12), constrained_layout=True)
+    fig.suptitle(
+        (
+            f"frame {idx} | "
+            f"filtered points: {filtered.shape[0]} | "
+            f"frame: {args.frame_preset} | res: {args.resolution:.2f} m"
+            f"{alignment_text}"
+        ),
+        fontsize=14,
+    )
+    # 1. plot camera view + paths
+    ax = axes[0, 0]
+    trajectories = np.concatenate((np.expand_dims(before_path, 0), np.expand_dims(after_path, 0)))
+    overlay = overlay_path(trajectories=trajectories, img=rgb, cam_matrix=cam_matrix, T_cam_from_base=T_cam_from_base)
+    ax.imshow(overlay)
+    ax.set_title("Egocentric with paths")
+    # ax.axis("off")
+
+    # plot topdown height map
+    ax = axes[0, 1]
+    if filtered.shape[0] > 0:
+        point_count = filtered.shape[0]
+        if point_count > 25000:
+            sample_idx = np.linspace(0, point_count - 1, 25000).astype(np.int32)
+            filtered_plot = filtered[sample_idx]
+        else:
+            filtered_plot = filtered
+        scatter = ax.scatter(
+            filtered_plot[:, 0],
+            filtered_plot[:, 1],
+            c=filtered_plot[:, 2],
+            s=1.0,
+            alpha=0.45,
+            cmap="viridis",
+            linewidths=0.0,
+        )
+        plt.colorbar(scatter, ax=ax, fraction=0.046, pad=0.04, label="height z (m)")
+    ax.scatter([sensor_xy[0]], [sensor_xy[1]], marker="x", s=36, c="red", linewidths=1.5)
+    ax.set_xlim(args.x_min, args.x_max)
+    ax.set_ylim(args.y_min, args.y_max)
+    ax.set_title("Filtered BEV Points + Object Goals")
+    ax.set_xlabel("x (m)")
+    ax.set_ylabel("y (m)")
+    ax.set_aspect("equal", adjustable="box")
+
+    # 2. occupied top-down view
+    plot_bool_map(axes[0, 2], result["occupied_mask"], extent, "Occupied", sensor_xy)
+    # visible free mask
+    plot_bool_map(axes[0, 3], result["visible_free_mask"], extent, "Visible Free", sensor_xy)
+
+    # 3. Depth map in camera view instead of Unknown mask
+    # the depth y-axis are flipped
+    plot_scalar_map(axes[1, 0], depth[::-1, :], extent, "Depth",
+                    sensor_xy, cmap="coolwarm", vmin=0, vmax=depth_scale, )
+
+    # occupied mask
+    ax = axes[1, 1]
+    ax.imshow(semantic_bev_image(result["occupied_mask"], result["visible_free_mask"], result["unknown_mask"]),
+              origin="lower", extent=extent)
+    ax.scatter([sensor_xy[0]], [sensor_xy[1]], marker="x", s=36, c="yellow", linewidths=1.5)
+    ax.set_title("Red:occupied, Grey:unknown")
+    ax.set_xlabel("x (m)")
+    ax.set_ylabel("y (m)")
+    ax.set_aspect("equal", adjustable="box")
+
     # 4. ESDF + paths
-    plot_scalar_map(axes[1, 1], esdf, extent,"ESDF (m)",
-                    sensor_xy, cmap="coolwarm", vmin=-esdf_scale, vmax=esdf_scale,)
-    axes[1, 1].plot(before_path[:, 0], before_path[:, 1], color="red", linewidth=2.2)
-    axes[1, 1].plot(after_path[:, 0], after_path[:, 1], color="green", linewidth=2.2)
+    plot_scalar_map(axes[1, 2], esdf, extent,"ESDF (m)",
+                    sensor_xy, cmap=custom_cmap, vmin=-esdf_scale, vmax=esdf_scale,)
+    axes[1, 2].plot(before_path[:, 0], before_path[:, 1], color="red", linewidth=2.2)
+    axes[1, 2].plot(after_path[:, 0], after_path[:, 1], color="green", linewidth=2.2)
+
+    # plot clearance
+    plot_scalar_map(
+        axes[1, 3],
+        clearance,
+        extent,
+        "Clearance (m)",
+        sensor_xy,
+        cmap="coolwarm",
+        vmin=-clearance_scale,
+        vmax=clearance_scale,
+    )
+
     # Render the Matplotlib figure into an RGB NumPy array.
     fig.canvas.draw()
     image_rgb = np.asarray(fig.canvas.buffer_rgba())[:, :, :3].copy()

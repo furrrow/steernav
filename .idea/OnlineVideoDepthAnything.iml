@@ -5,6 +5,7 @@
       <sourceFolder url="file://$MODULE_DIR$/services/OnlineVideoDepthAnything/OnlineVideoDepthAnything" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/services/OnlineVideoDepthAnything/src" isTestSource="false" />
     </content>
+    <orderEntry type="jdk" jdkName="uv (steernav)" jdkType="Python SDK" />
     <orderEntry type="sourceFolder" forTests="false" />
     <orderEntry type="module" module-name="custom_utils" exported="" />
   </component>

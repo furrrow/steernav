@@ -1,6 +1,7 @@
 from __future__ import annotations
 import time
 import argparse
+import warnings
 from argparse import Namespace
 from typing import Any
 
@@ -11,6 +12,7 @@ import torch
 from numpy import dtype, ndarray
 from numpy.typing import NDArray
 from PIL import Image
+from scipy.spatial import cKDTree
 from torch import Tensor
 
 from custom_utils.io_utils import load_calibration
@@ -19,7 +21,7 @@ import matplotlib
 matplotlib.use("TkAgg")
 from scipy.ndimage import zoom, gaussian_filter
 from moge.model.v2 import MoGeModel
-from custom_utils.esdf_utils import visualize_path_esdf, save_debug_figure
+from custom_utils.esdf_utils import visualize_path_esdf, save_debug_figure, debug_visualize
 from custom_utils.stream_handler import FrameStatus, InputStreamHandler
 from custom_utils.io_utils import colorize_pred, save_depth_video_mp4
 from custom_utils.pointcloud_utils import camera_to_base_transform, pointcloud_to_esdf_pipeline
@@ -55,11 +57,8 @@ class ValidESDFMesh(ESDFVisualMesh):
     valid: NDArray[np.bool]
     rows: int
     cols: int
-    nearest_found: bool
     nearest_rows: NDArray[np.int32] | None
     nearest_cols: NDArray[np.int32] | None
-    valid_rows: NDArray[np.int32] | None
-    valid_cols: NDArray[np.int32] | None
 
     def __post_init__(self) -> None:
         # Run parent checks (x, y, x_min, x_max validation)
@@ -76,11 +75,8 @@ class ValidESDFMesh(ESDFVisualMesh):
             valid: NDArray[np.bool],
             rows: int,
             cols: int,
-            nearest_found: bool = False,
             nearest_rows: NDArray[np.int32] | None = None,
             nearest_cols: NDArray[np.int32] | None = None,
-            valid_rows: NDArray[np.int32] | None = None,
-            valid_cols: NDArray[np.int32] | None = None,
     ) -> "ValidESDFMesh":
         # Extract attributes from base_mesh and instantiate
         base_kwargs = {f.name: getattr(base_mesh, f.name) for f in fields(ESDFVisualMesh)}
@@ -89,11 +85,8 @@ class ValidESDFMesh(ESDFVisualMesh):
             valid=valid,
             rows=rows,
             cols=cols,
-            nearest_found=nearest_found,
             nearest_rows=nearest_rows,
             nearest_cols=nearest_cols,
-            valid_rows=valid_rows,
-            valid_cols=valid_cols,
         )
 
 def build_esdf_mesh(esdf_raw, intrinsics, args: argparse.Namespace, free_space_scaling_factor=1.0) -> ESDFVisualMesh:
@@ -194,27 +187,34 @@ def esdf_validity_map(mesh: ESDFVisualMesh) -> ValidESDFMesh:
         from scipy.ndimage import distance_transform_edt
         _dist, nearest = distance_transform_edt(~valid, return_indices=True)
         nearest_found = True
-        nearest_rows = nearest[0].astype(np.int32, copy=False) # (336, 420)
-        nearest_cols = nearest[1].astype(np.int32, copy=False) # (336, 420)
-        valid_rows = None
-        valid_cols = None
+        nearest_rows = nearest[0].astype(np.int32, copy=False)  # (rows, cols)
+        nearest_cols = nearest[1].astype(np.int32, copy=False)  # (rows, cols)
     except Exception:
-        valid_rows, valid_cols = np.nonzero(valid)
+        warnings.warn("esdf_validity_map failed to find nearest via distance_transform_edt; using KDTree fallback.")
         nearest_found = False
-        nearest_rows = None
-        nearest_cols = None
-        valid_rows=valid_rows.astype(np.int32, copy=False) # (94692,)
-        valid_cols=valid_cols.astype(np.int32, copy=False) # (94692,)
+        valid_rows = np.nonzero(valid)[0].astype(np.int32, copy=False)
+        valid_cols = np.nonzero(valid)[1].astype(np.int32, copy=False)
+
+        # Fallback: Query all grid points against valid coordinates using KDTree
+        grid_r, grid_c = np.indices((rows, cols))
+        grid_pts = np.column_stack([grid_r.ravel(), grid_c.ravel()])
+        valid_pts = np.column_stack([valid_rows, valid_cols])
+
+        tree = cKDTree(valid_pts)
+        _, nearest_indices = tree.query(grid_pts)
+
+        nearest_rows = valid_rows[nearest_indices].reshape(rows, cols)
+        nearest_cols = valid_cols[nearest_indices].reshape(rows, cols)
+
+        # Fill mesh.z_height using nearest coordinates for both success and fallback paths
+    mesh.z_height = mesh.z_height[nearest_rows, nearest_cols]
     return ValidESDFMesh.from_base_mesh(
         base_mesh=mesh,
         valid=valid,
         rows=rows,
         cols=cols,
-        nearest_found=nearest_found,
         nearest_rows=nearest_rows,
-        nearest_cols=nearest_cols,
-        valid_rows=valid_rows,
-        valid_cols=valid_cols,)
+        nearest_cols=nearest_cols,)
 
 
 def constrain_xy_to_esdf(xy: np.ndarray, valid_mesh: ValidESDFMesh) -> np.ndarray:
@@ -229,19 +229,9 @@ def constrain_xy_to_esdf(xy: np.ndarray, valid_mesh: ValidESDFMesh) -> np.ndarra
     bad = outside | ~valid[row, col]
     if not np.any(bad):
         return pts
-    match valid_mesh:
-        # if nearest_found, Extracts nearest_rows and nearest_cols into local variables
-        case ValidESDFMesh(nearest_found=True, nearest_rows=nearest_rows, nearest_cols=nearest_cols):
-            bad_rows, bad_cols = row[bad].copy(), col[bad].copy()
-            row[bad] = nearest_rows[bad_rows, bad_cols]
-            col[bad] = nearest_cols[bad_rows, bad_cols]
-        # else, Extracts valid_rows and valid_cols into local variables
-        case ValidESDFMesh(nearest_found=False, valid_rows=valid_rows, valid_cols=valid_cols):
-            valid_xy = np.column_stack([valid_mesh.x[valid_rows, valid_cols], valid_mesh.y[valid_rows, valid_cols]])
-            for idx in np.flatnonzero(bad):
-                nearest = int(np.argmin(np.sum((valid_xy - pts[idx]) ** 2, axis=1)))
-                row[idx] = valid_rows[nearest]
-                col[idx] = valid_cols[nearest]
+    bad_rows, bad_cols = row[bad].copy(), col[bad].copy()
+    row[bad] = valid_mesh.nearest_rows[bad_rows, bad_cols]
+    col[bad] = valid_mesh.nearest_cols[bad_rows, bad_cols]
     pts[bad, 0] = valid_mesh.x[row[bad], col[bad]]
     pts[bad, 1] = valid_mesh.y[row[bad], col[bad]]
     return pts
@@ -311,11 +301,9 @@ def adam_update_numpy(
     # Initialize Adam moment vectors (same shape as path)
     m = np.zeros_like(path)
     v = np.zeros_like(path)
-
     for t in range(1, iterations + 1):
         # 1. Evaluate analytical gradient at current path positions
-        _, grad_xy, _ = sample_mesh_z_and_gradient(path, valid_mesh, esdf_height_scale)
-
+        z_scaled, grad_xy, _ = sample_mesh_z_and_gradient(path, valid_mesh, esdf_height_scale)
         # 2. Compute smooth force gradient (derivative of Laplacian objective)
         smooth_force = np.zeros_like(path)
         smooth_force[1:-1] = path[:-2] - 2.0 * path[1:-1] + path[2:]
@@ -341,7 +329,22 @@ def adam_update_numpy(
 
         # 5. Parameter Update
         path -= lr * m_hat / (np.sqrt(v_hat) + eps)
+        # path = constrain_xy_to_esdf(path, valid_mesh)
 
+    # filter out waypoints where z-height is positive, indicating obstacle.
+    z_scaled, grad_xy, _ = sample_mesh_z_and_gradient(path, valid_mesh, esdf_height_scale)
+    z_mask = np.argwhere(z_scaled > 0)
+    # print(f"original path: {path}")
+    # print(f"z_scaled: {z_scaled}")
+    if len(z_mask) > 0:
+        last_valid_idx = z_mask[0][0] - 1
+        if last_valid_idx == -1:
+            path = np.zeros_like(path)
+            print("all path below esdf criteria, passing zero paths")
+            print(path)
+        else:
+            path[last_valid_idx + 1:] = path[last_valid_idx]
+            print(f"constraining path to idx {last_valid_idx} pt: {path[last_valid_idx]}")
     return path
 
 
@@ -379,6 +382,7 @@ def update_trajectories(args: Namespace,
                                     esdf_height_scale=args.esdf_height_scale,
                                     lr=lr, smooth_weight=smooth_weight,
                                     iterations=n_iter, )
+    opt_path_xy = constrain_xy_to_esdf(opt_path_xy, valid_mesh)
     if time_session:
         t3 = time.perf_counter()
         print(f"constrain path, adam_update_numpy {(t3 - t2) * 1000:.1f} ms")
@@ -392,7 +396,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--h-min", type=float, default=0.5, help="Minimum kept height in meters.")
     parser.add_argument("--h-max", type=float, default=1.5, help="Maximum kept height in meters.")
     parser.add_argument("--x-min", type=float, default=0.0, help="Minimum forward extent in meters.")
-    parser.add_argument("--x-max", type=float, default=20.0, help="Maximum forward extent in meters.")
+    parser.add_argument("--x-max", type=float, default=10.0, help="Maximum forward extent in meters.")
     parser.add_argument("--y-min", type=float, default=-5.0, help="Minimum lateral extent in meters.")
     parser.add_argument("--y-max", type=float, default=5.0, help="Maximum lateral extent in meters.")
     parser.add_argument("--resolution", type=float, default=0.10, help="Grid resolution in meters per cell.")
@@ -409,11 +413,13 @@ def main() -> int:
     args = parse_args()
     # Initialize predictor (single-GPU streaming)
     save_video_toggle = False
-    time_session = True
+    time_session = False
     stream_type = "video"  # ["yarp", "video", "webcam"]
-    video_path = "/home/jim/Projects/steernav/services/OnlineVideoDepthAnything/assets/example_videos/Cars_and_Gasstation.mp4"
-    video_path = "/media/jim/Ironwolf/datasets/scand_data/random_mdps/A_Spot_Ballstructure_UTTower_Wed_Nov_10_60.avi"
-    camera_matrix_dir = "camera_matrix.json"
+    # video_path = "/home/jim/Projects/steernav/assets/Cars_and_Gasstation.mp4"
+    # video_path = "/media/jim/Ironwolf/datasets/scand_data/random_mdps/A_Spot_Ballstructure_UTTower_Wed_Nov_10_60.avi"
+    video_path = "/home/jim/Projects/steernav/assets/jim_flownav_test.mp4"
+    camera_matrix_dir = "old_cam_matrix.json"
+    # camera_matrix_dir = "ghost_fl_cam_matrix.json"
     output_folder = "demo_video"
     webcam_index = 0
     yarp_port = "/sam3/rgbImage:i"
@@ -424,8 +430,8 @@ def main() -> int:
     model_name = "Ruicheng/moge-2-vitl-normal"
     print("running", model_name)
     model = MoGeModel.from_pretrained(model_name).to(device).eval()
-    n_pts = 8
-    straight_path = np.stack((np.linspace(0, 15, n_pts + 1), np.linspace(0, 1, n_pts + 1))).T
+    n_pts = 20
+    straight_path = np.stack((np.linspace(0, 15, n_pts + 1), np.linspace(0, 0, n_pts + 1))).T
 
     cam_matrix, dist_coeffs, T_base_from_cam = load_calibration(camera_matrix_dir)
     T_cam_from_base = np.linalg.inv(T_base_from_cam)
@@ -455,7 +461,7 @@ def main() -> int:
     # Create a resizable window
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
     # Set fixed width x height (e.g., 640x480 or 1280x720)
-    cv2.resizeWindow(window_name, 1280, 720)
+    cv2.resizeWindow(window_name, 1000, 1000)
 
     prev_time = time.time()
     try:
@@ -517,11 +523,18 @@ def main() -> int:
             # 5. Render baseline and optimized paths together
 
             # t0 = time.perf_counter()
+            # resize original frame for visualization
+            original_frame = cv2.resize(original_frame, dsize=(1280, 720), interpolation=cv2.INTER_CUBIC)
             esdf_surface = visualize_path_esdf(depth=depth, rgb=original_frame,
                                                result=esdf_result, cam_matrix=cam_matrix,
                                                T_cam_from_base=T_cam_from_base,
                                                before_path=init_path_xy, after_path=opt_path_xy,
                                                idx=frame_idx, args=args)
+            # esdf_surface = debug_visualize(depth=depth, rgb=original_frame,
+            #                                    result=esdf_result, cam_matrix=cam_matrix,
+            #                                    T_cam_from_base=T_cam_from_base,
+            #                                    before_path=init_path_xy, after_path=opt_path_xy,
+            #                                    idx=0, args=args)
             # t1 = time.perf_counter()
             # print(f"visualize_path_esdf {(t1 - t0) * 1000:.1f} ms")
             # Display FPS
