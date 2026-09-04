@@ -1,4 +1,5 @@
 import cv2
+from matplotlib import pyplot as plt, patches as patches
 from tqdm import tqdm
 import numpy as np
 import math
@@ -150,48 +151,27 @@ def load_video_as_numpy(path):
     return np.stack(frames)
 
 def save_video_mp4(video: np.ndarray, path: str, fps=20):
-    vmin = float(video.min())
-    vmax = float(video.max())
+    vmin, vmax = float(video.min()), float(video.max())
 
     h, w = video.shape[1], video.shape[2]
-
-    writer = cv2.VideoWriter(
-        path,
-        cv2.VideoWriter_fourcc(*'mp4v'),
-        fps,
-        (w, h)
-    )
-
-    # colormap = cm.get_cmap('Spectral')
+    writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (w, h))
     colormap = matplotlib.colormaps["Spectral"]
 
-    for frame in video:
+    for frame in tqdm(video):
         # Normalize globally
         norm = (np.clip(frame, vmin, vmax) - vmin) / (vmax - vmin + 1e-8)
-
         # Apply matplotlib colormap → RGBA in [0..1]
         colored = colormap(norm)[..., :3]   # drop alpha channel
-
         # Convert to uint8 + BGR for OpenCV
         colored_bgr = (colored * 255).astype(np.uint8)[..., ::-1]
-
         writer.write(colored_bgr)
-
     writer.release()
 
 def save_depth_video_mp4(video: np.ndarray, path: str, fps=20):
     h, w = video.shape[1], video.shape[2]
-
-    writer = cv2.VideoWriter(
-        path,
-        cv2.VideoWriter_fourcc(*'mp4v'),
-        fps,
-        (w, h)
-    )
-
+    writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (w, h))
     for frame in tqdm(video):
         writer.write(frame)
-
     writer.release()
 
 def overlay_path(trajectories: np.ndarray,
@@ -283,3 +263,60 @@ def load_calibration(json_path: str):
 
     dist = None  # explicitly no distortion
     return K, dist, T_base_from_cam
+
+
+def plot_bbox(image: np.ndarray, data,
+              tracker_id = None,
+              show_plot=True, return_img=False):
+    h, w = image.shape[:2]
+
+    # Create figure whose canvas exactly matches the image dimensions
+    fig = plt.figure(figsize=(w / 100, h / 100), dpi=100)
+    ax = fig.add_axes([0, 0, 1, 1])
+    # Display the image
+    ax.imshow(image)
+
+    # Plot each bounding box
+    for idx in range(len(data['labels'])):
+        bbox = data['bboxes'][idx]
+        label = data['labels'][idx]
+        # Unpack the bounding box coordinates
+        x1, y1, x2, y2 = bbox
+        # Create a Rectangle patch
+        rect = patches.Rectangle((x1, y1), x2 - x1, y2 - y1, linewidth=1, edgecolor='r', facecolor='none')
+        # Add the rectangle to the Axes
+        ax.add_patch(rect)
+        if tracker_id is not None:
+            if len(tracker_id) > idx:
+                label = f"{label}:{tracker_id[idx]}"
+        # Annotate the label
+        ax.text(x1, y1, label, color='white', fontsize=8, bbox=dict(facecolor='red', alpha=0.5))
+
+        # Remove the axis ticks and labels
+    ax.axis('off')
+
+    # Show the plot
+    if show_plot:
+        plt.show()
+    if return_img:
+        # Render the Matplotlib figure into an RGB NumPy array.
+        fig.canvas.draw()
+        image_rgb = np.asarray(fig.canvas.buffer_rgba())[:, :, :3].copy()
+        plt.close(fig)
+        return image_rgb
+    return None
+
+
+def filter_unwanted_results(bbox_result, img_w, img_h):
+    total_img_area = img_w * img_h
+    filtered_results = {
+        'bboxes': [],
+        'labels': []
+    }
+    for bbox, label in zip(bbox_result['bboxes'], bbox_result['labels']):
+        x1, y1, x2, y2 = bbox
+        box_area = (x2 - x1) * (y2 - y1)
+        if (total_img_area * 0.01 ) < box_area < (total_img_area * 0.8 ):
+            filtered_results['bboxes'].append(bbox)
+            filtered_results['labels'].append(label)
+    return filtered_results

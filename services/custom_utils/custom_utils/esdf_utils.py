@@ -13,7 +13,8 @@ from typing import Any, Sequence
 
 import numpy as np
 from PIL import Image, ImageDraw
-from custom_utils.io_utils import overlay_path
+from custom_utils.io_utils import overlay_path, plot_bbox
+import cv2
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
 import matplotlib
 
@@ -541,10 +542,11 @@ def save_debug_figure(
     plt.close(fig)
     return image_rgb
 
-def visualize_path_esdf(
+def visualize_path(
         depth: np.ndarray,
         rgb: np.ndarray,
-        result: dict[str, np.ndarray],
+        esdf_result: dict[str, np.ndarray],
+        bbox_result: dict[str, np.ndarray],
         cam_matrix: np.ndarray,
         T_cam_from_base: np.ndarray,
         before_path:np.ndarray,
@@ -555,11 +557,11 @@ def visualize_path_esdf(
     extent = [args.x_min, args.x_max, args.y_min, args.y_max]
     extent_flipped = [args.y_min, args.y_max, args.x_min, args.x_max]
     sensor_xy = (args.sensor_x, args.sensor_y)
-    filtered = result["points_filtered"]
-    esdf = result["esdf"]
+    filtered = esdf_result["points_filtered"]
+    esdf = esdf_result["esdf"]
     depth_scale = finite_percentile_abs(depth, percentile=99.0)
     esdf_scale = finite_percentile_abs(esdf, percentile=99.0)
-    ground_alignment = result.get("ground_alignment") if isinstance(result, dict) else None
+    ground_alignment = esdf_result.get("ground_alignment") if isinstance(esdf_result, dict) else None
     alignment_text = ""
     if isinstance(ground_alignment, dict) and ground_alignment.get("enabled"):
         source = ground_alignment.get("normal_source", "unknown")
@@ -582,10 +584,12 @@ def visualize_path_esdf(
     # 1. plot camera view + paths
     ax = axes[0, 0]
     trajectories = np.concatenate((np.expand_dims(before_path, 0), np.expand_dims(after_path, 0)))
-    overlay = overlay_path(trajectories=trajectories, img=rgb, cam_matrix=cam_matrix, T_cam_from_base=T_cam_from_base)
+    bbox_img = plot_bbox(rgb, bbox_result, show_plot=False, return_img=True)
+    resized = cv2.resize(bbox_img, dsize=(args.img_w, args.img_h), interpolation=cv2.INTER_CUBIC)
+    overlay = overlay_path(trajectories=trajectories, img=resized, cam_matrix=cam_matrix, T_cam_from_base=T_cam_from_base)
     ax.imshow(overlay)
-    ax.set_title("Egocentric with paths")
-    # ax.axis("off")
+    ax.set_title("Img with Bounding Boxes and paths")
+    ax.axis("off")
 
     # ESDF + paths
     plot_scalar_map_flipped(axes[0, 1], esdf, extent_flipped, "ESDF (m)",
@@ -603,12 +607,119 @@ def visualize_path_esdf(
     # occupied / free / unknown mixed view:
     ax = axes[1, 1]
     ax.imshow(
-        semantic_bev_image(result["occupied_mask"], result["visible_free_mask"], result["unknown_mask"]).swapaxes(0, 1),
+        semantic_bev_image(esdf_result["occupied_mask"], esdf_result["visible_free_mask"], esdf_result["unknown_mask"]).swapaxes(0, 1),
         origin="lower", extent=extent_flipped)
     # know that the x-axis is flipped , so that it goes from pos -> negative
     ax.invert_xaxis()
     ax.scatter([sensor_xy[1]], [sensor_xy[0]], marker="x", s=36, c="yellow", linewidths=1.5)
     ax.set_title("Red:occupied, Grey:unknown")
+    ax.set_xlabel("y (m)")
+    ax.set_ylabel("x (m)")
+    ax.set_aspect("equal", adjustable="box")
+    # Render the Matplotlib figure into an RGB NumPy array.
+    fig.canvas.draw()
+    image_rgb = np.asarray(fig.canvas.buffer_rgba())[:, :, :3].copy()
+    plt.close(fig)
+    return image_rgb
+
+def visualize_static_dynamic_paths(
+        depth: np.ndarray,
+        rgb: np.ndarray,
+        dynamic_esdf_result: dict[str, np.ndarray],
+        static_esdf_result: dict[str, np.ndarray],
+        bbox_result: dict[str, np.ndarray],
+        cam_matrix: np.ndarray,
+        T_cam_from_base: np.ndarray,
+        before_path:np.ndarray,
+        static_path :np.ndarray,
+        dynamic_path :np.ndarray,
+        idx: int,
+        args: argparse.Namespace,
+) -> np.ndarray:
+    extent = [args.x_min, args.x_max, args.y_min, args.y_max]
+    extent_flipped = [args.y_min, args.y_max, args.x_min, args.x_max]
+    sensor_xy = (args.sensor_x, args.sensor_y)
+    filtered = dynamic_esdf_result["points_filtered"]
+    dynamic_esdf = dynamic_esdf_result["esdf"]
+    static_esdf = static_esdf_result["esdf"]
+    depth_scale = finite_percentile_abs(depth, percentile=99.0)
+    esdf_scale = finite_percentile_abs(static_esdf, percentile=99.0)
+    ground_alignment = dynamic_esdf_result.get("ground_alignment") if isinstance(dynamic_esdf_result, dict) else None
+    alignment_text = ""
+    if isinstance(ground_alignment, dict) and ground_alignment.get("enabled"):
+        source = ground_alignment.get("normal_source", "unknown")
+        applied_tilt = ground_alignment.get("applied_tilt_deg")
+        if applied_tilt is None:
+            alignment_text = f" | ground align: {source}"
+        else:
+            alignment_text = f" | ground align: {source} {float(applied_tilt):.1f} deg"
+
+    fig, axes = plt.subplots(2, 3, figsize=(16, 12))
+    fig.suptitle(
+        (
+            f"frame {idx} | "
+            f"filtered points: {filtered.shape[0]} | "
+            f"frame: {args.frame_preset} | res: {args.resolution:.2f} m"
+            f"{alignment_text}"
+        ),
+        fontsize=14,
+    )
+    # 1. plot camera view + paths
+    ax = axes[0, 0]
+    trajectories = np.concatenate((np.expand_dims(before_path, 0), np.expand_dims(dynamic_path, 0)))
+    bbox_img = plot_bbox(rgb, bbox_result, show_plot=False, return_img=True)
+    resized = cv2.resize(bbox_img, dsize=(args.img_w, args.img_h), interpolation=cv2.INTER_CUBIC)
+    overlay = overlay_path(trajectories=trajectories, img=resized, cam_matrix=cam_matrix, T_cam_from_base=T_cam_from_base)
+    ax.imshow(overlay)
+    ax.set_title("Img with Bounding Boxes and paths")
+    ax.axis("off")
+
+    # ESDF + paths
+    plot_scalar_map_flipped(axes[0, 1], dynamic_esdf, extent_flipped, "dynamic ESDF (m)",
+                            sensor_xy, cmap=custom_cmap, vmin=-esdf_scale, vmax=esdf_scale, )
+    # know that the x-axis is flipped , so that it goes from pos -> negative
+    axes[0, 1].invert_xaxis()
+    axes[0, 1].plot(before_path[:, 1], before_path[:, 0], color="red", linewidth=2.2)
+    axes[0, 1].plot(dynamic_path[:, 1], dynamic_path[:, 0], color="green", linewidth=2.2)
+
+    # ESDF + paths
+    plot_scalar_map_flipped(axes[0, 2], static_esdf, extent_flipped, "static ESDF (m)",
+                            sensor_xy, cmap=custom_cmap, vmin=-esdf_scale, vmax=esdf_scale, )
+    # know that the x-axis is flipped , so that it goes from pos -> negative
+    axes[0, 2].invert_xaxis()
+    axes[0, 2].plot(before_path[:, 1], before_path[:, 0], color="red", linewidth=2.2)
+    axes[0, 2].plot(static_path[:, 1], static_path[:, 0], color="green", linewidth=2.2)
+
+
+    # 3. Depth map in camera view
+    # the depth y-axis are flipped
+    plot_scalar_map(axes[1, 0], depth[::-1, :], extent, "Depth",
+                    sensor_xy, cmap="coolwarm", vmin=0, vmax=depth_scale, )
+
+    # occupied / free / unknown mixed view:
+    ax = axes[1, 1]
+    ax.imshow(
+        semantic_bev_image(dynamic_esdf_result["occupied_mask"], dynamic_esdf_result["visible_free_mask"],
+                           dynamic_esdf_result["unknown_mask"]).swapaxes(0, 1),
+        origin="lower", extent=extent_flipped)
+    # know that the x-axis is flipped , so that it goes from pos -> negative
+    ax.invert_xaxis()
+    ax.scatter([sensor_xy[1]], [sensor_xy[0]], marker="x", s=36, c="yellow", linewidths=1.5)
+    ax.set_title("Dynamic!! Red:occupied, Grey:unknown")
+    ax.set_xlabel("y (m)")
+    ax.set_ylabel("x (m)")
+    ax.set_aspect("equal", adjustable="box")
+
+    # occupied / free / unknown mixed view:
+    ax = axes[1, 2]
+    ax.imshow(
+        semantic_bev_image(static_esdf_result["occupied_mask"], static_esdf_result["visible_free_mask"],
+                           static_esdf_result["unknown_mask"]).swapaxes(0, 1),
+        origin="lower", extent=extent_flipped)
+    # know that the x-axis is flipped , so that it goes from pos -> negative
+    ax.invert_xaxis()
+    ax.scatter([sensor_xy[1]], [sensor_xy[0]], marker="x", s=36, c="yellow", linewidths=1.5)
+    ax.set_title("Static: Red:occupied, Grey:unknown")
     ax.set_xlabel("y (m)")
     ax.set_ylabel("x (m)")
     ax.set_aspect("equal", adjustable="box")

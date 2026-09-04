@@ -3,29 +3,40 @@ import time
 import argparse
 import warnings
 from argparse import Namespace
-from typing import Any
-
 import cv2
 from dataclasses import dataclass, fields
 import numpy as np
-import torch
-from numpy import dtype, ndarray
+from numpy import ndarray
 from numpy.typing import NDArray
 from PIL import Image
-from scipy.spatial import cKDTree
-from torch import Tensor
 
-from custom_utils.io_utils import load_calibration
+import torch
+from torch import Tensor
+from transformers import AutoProcessor, AutoModelForCausalLM
 
 import matplotlib
 matplotlib.use("TkAgg")
 from scipy.ndimage import zoom, gaussian_filter
+from scipy.spatial import cKDTree
 from moge.model.v2 import MoGeModel
-from custom_utils.esdf_utils import visualize_path_esdf, save_debug_figure, debug_visualize
-from custom_utils.stream_handler import FrameStatus, InputStreamHandler
-from custom_utils.io_utils import colorize_pred, save_depth_video_mp4
-from custom_utils.pointcloud_utils import camera_to_base_transform, pointcloud_to_esdf_pipeline
+import supervision as sv
 
+from custom_utils.esdf_utils import visualize_static_dynamic_paths
+from custom_utils.stream_handler import FrameStatus, InputStreamHandler
+from custom_utils.io_utils import save_depth_video_mp4
+from custom_utils.io_utils import load_calibration, filter_unwanted_results
+from custom_utils.pointcloud_utils import camera_to_base_transform, pointcloud_to_esdf_pipeline, update_points
+
+
+@dataclass
+class BoxRecord:
+    x1: float
+    y1: float
+    x2: float
+    y2: float
+    centroid: float
+    area: float
+    median_depth: float
 
 @dataclass
 class ESDFVisualMesh:
@@ -344,7 +355,7 @@ def adam_update_numpy(
             print(path)
         else:
             path[last_valid_idx + 1:] = path[last_valid_idx]
-            print(f"constraining path to idx {last_valid_idx} pt: {path[last_valid_idx]}")
+            # print(f"constraining path to idx {last_valid_idx} pt: {path[last_valid_idx]}")
     return path
 
 
@@ -403,11 +414,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sensor-x", type=float, default=0.0, help="Sensor x location in map frame.")
     parser.add_argument("--sensor-y", type=float, default=0.0, help="Sensor y location in map frame.")
     parser.add_argument("--camera-height", type=float, default=1.0, help="AGL, in meters")
+    parser.add_argument("--img_w", type=int, default=1280, help="resize img width to correctly overlay path")
+    parser.add_argument("--img_h", type=int, default=720, help="resize img height to correctly overlay path")
     parser.add_argument("--esdf-height-scale", type=float, default=1.8)
     parser.add_argument("--esdf-height-clip-m", type=float, default=2.0)
     parser.add_argument("--esdf-projected-smooth-sigma", type=float, default=1.5)
     parser.add_argument("--esdf-projected-color-percentile", type=float, default=80.0)
     return parser.parse_args()
+
 
 def main() -> int:
     args = parse_args()
@@ -416,8 +430,8 @@ def main() -> int:
     time_session = False
     stream_type = "video"  # ["yarp", "video", "webcam"]
     # video_path = "/home/jim/Projects/steernav/assets/Cars_and_Gasstation.mp4"
-    # video_path = "/media/jim/Ironwolf/datasets/scand_data/random_mdps/A_Spot_Ballstructure_UTTower_Wed_Nov_10_60.avi"
-    video_path = "/home/jim/Projects/steernav/assets/jim_flownav_test.mp4"
+    # video_path = "/home/jim/Projects/steernav/assets/jim_flownav_test.mp4"
+    video_path = "/home/jim/Projects/steernav/assets/corridoor_omni_ft_2_left.mp4"
     camera_matrix_dir = "old_cam_matrix.json"
     # camera_matrix_dir = "ghost_fl_cam_matrix.json"
     output_folder = "demo_video"
@@ -426,10 +440,21 @@ def main() -> int:
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     # Load model
-    model_name = "Ruicheng/moge-3-vitl"
-    model_name = "Ruicheng/moge-2-vitl-normal"
-    print("running", model_name)
-    model = MoGeModel.from_pretrained(model_name).to(device).eval()
+    depth_model_name = "Ruicheng/moge-2-vitl-normal"
+    vision_model_name = "microsoft/Florence-2-large"
+    print("running", depth_model_name, vision_model_name)
+    depth_model = MoGeModel.from_pretrained(depth_model_name).to(device).eval()
+    torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+    obj_detect_model = AutoModelForCausalLM.from_pretrained(vision_model_name,
+                                                            torch_dtype=torch_dtype,
+                                                            attn_implementation="eager",
+                                                            trust_remote_code=True).to(device)
+    processor = AutoProcessor.from_pretrained(vision_model_name, trust_remote_code=True)
+    task_prompt = "<CAPTION_TO_PHRASE_GROUNDING>"
+    text_prompt = "people"
+    prompt = task_prompt + text_prompt
+    tracker = sv.ByteTrack()
+
     n_pts = 20
     straight_path = np.stack((np.linspace(0, 15, n_pts + 1), np.linspace(0, 0, n_pts + 1))).T
 
@@ -441,27 +466,27 @@ def main() -> int:
         kind=stream_type,
         video_path=video_path,
         webcam_index=webcam_index,
-        # fps_request=2,
-        yarp_port_name=yarp_port,
+        skip_n_fr=10,
     )
     print(f"Opening source: {stream_type}")
     src.open()
     stream_buffer = src.read()
-    print(f"stream size: {stream_buffer.frame.shape}")
 
     peak_memory = 0
     frame_idx = 0
 
     frame_timestamps = []  # To compute output fps
     video_frames = []  # Buffer of frames for final video save
-
+    detection_queue = []
+    detection_queue_len = 20
     stop_processing = False
-
+    # shrink image dimensions
+    img_w, img_h = 640, 480
     window_name = "esdf_surface"
     # Create a resizable window
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
     # Set fixed width x height (e.g., 640x480 or 1280x720)
-    cv2.resizeWindow(window_name, 1000, 1000)
+    cv2.resizeWindow(window_name, 1200, 900)
 
     prev_time = time.time()
     try:
@@ -481,7 +506,8 @@ def main() -> int:
 
             original_frame = stream_buffer.frame
             # shrink frame for faster inference
-            frame_rgb = cv2.resize(original_frame, dsize=(640, 480), interpolation=cv2.INTER_CUBIC)
+            frame_rgb = cv2.resize(original_frame, dsize=(img_w, img_h), interpolation=cv2.INTER_CUBIC)
+            pil_image = Image.fromarray(frame_rgb)
             input_image = torch.from_numpy(frame_rgb).to(device).permute(2, 0, 1).float().div_(255.0)
             """
                 MOGE model inference:
@@ -498,19 +524,72 @@ def main() -> int:
                 contain `refine_steps + 1` entries, including the initial prediction.
             """
             t0 = time.perf_counter()
-            model_output = model.infer(input_image)
-            moge_points = model_output['points'].cpu().numpy()
-            estimated_cam_matrix = model_output['intrinsics'].cpu().numpy()
+            depth_model_output = depth_model.infer(input_image)
+            moge_points = depth_model_output['points'].cpu().numpy()
+            estimated_cam_matrix = depth_model_output['intrinsics'].cpu().numpy()
             points_input = moge_points.astype(np.float32, copy=True)
-            points_input[~model_output["mask"].cpu().numpy().astype(bool)] = np.nan
-            depth = model_output['depth'].cpu().numpy()
+            points_input[~depth_model_output["mask"].cpu().numpy().astype(bool)] = np.nan
+            depth = depth_model_output['depth'].cpu().numpy()
 
             t1 = time.perf_counter()
             print(" = = = = = = = = = ")
-            print(f"moge inference took {(t1 - t0) * 1000:.1f} ms")
+            print(f"{depth_model_name} inference took {(t1 - t0) * 1000:.1f} ms")
 
-            esdf_result, init_path_xy, opt_path_xy = update_trajectories(
+            obj_detect_inputs = processor(text=prompt, images=pil_image, return_tensors="pt").to(device, torch_dtype)
+            generated_ids = obj_detect_model.generate(
+                input_ids=obj_detect_inputs["input_ids"],
+                pixel_values=obj_detect_inputs["pixel_values"],
+                max_new_tokens=4096,
+                num_beams=3,
+                do_sample=False
+            )
+            generated_text = processor.batch_decode(generated_ids, skip_special_tokens=False)[0]
+
+            obj_detect_result = processor.post_process_generation(generated_text, task=task_prompt,
+                                                              image_size=(pil_image.width, pil_image.height))
+            bbox_result = obj_detect_result[task_prompt]
+            bbox_result = filter_unwanted_results(bbox_result, img_w, img_h)
+            bbox_only = [bbox for bbox, label in zip(bbox_result['bboxes'], bbox_result['labels'])]
+            if len(bbox_only) > 0:
+                dummy_confidence = np.ones(len(bbox_only)) * 0.7
+                sv_detection = sv.Detections(xyxy=np.array(bbox_only), confidence=dummy_confidence)
+                detections = tracker.update_with_detections(sv_detection)
+                pos_dict = {}
+                for box, id in zip(detections.xyxy, detections.tracker_id):
+                    x1, y1, x2, y2 = box
+                    box_3d_pts = points_input[int(y1):int(y2), int(x1):int(x2)] # (120, 40, 3)
+                    if box_3d_pts.size == 0:
+                        continue
+                    pts_flat = box_3d_pts.reshape(-1, 3) # (N, 3)
+                    valid_mask = ~np.isnan(pts_flat).any(axis=1) & (pts_flat != 0).any(axis=1) # (N,)
+                    valid_pts = pts_flat[valid_mask] # (N, 3)
+                    median_3d = np.median(valid_pts, axis=0)
+                    pos_dict[id] = median_3d
+                    print(f"detect id {id} median loc: {median_3d}")
+                # coopting the data field since it is unused.
+                detections.data = pos_dict
+                # pred_color = plot_bbox(frame_rgb, bbox_result, detections.tracker_id, show_plot=False, return_img=True)
+            else:
+                # pred_color = frame_rgb
+                detections = sv.Detections(xyxy=np.array([[0, 0, 0, 0]]), confidence=dummy_confidence, tracker_id=np.array([0]), data={})
+            # detection queue
+            detection_queue.append(detections)
+            if len(detection_queue) > detection_queue_len:
+                detection_queue.pop(0)
+            
+            t2 = time.perf_counter()
+            print(f"{vision_model_name} inference took {(t2 - t1) * 1000:.1f} ms")
+            # 19fps in video, skipping 10 fr, roughly 2fps
+            updated_points = update_points(points_input, detection_queue,
+                                           robot_velocity_camera=np.array([0, 0, 0.1]),
+                                           time_incr=0.5, time_look_ahead=2.0)
+
+            static_esdf_result, init_path_xy, static_path_xy = update_trajectories(
                 args, points_input, estimated_cam_matrix, straight_path, time_session)
+
+            dynamic_esdf_result, init_path_xy, dynamic_path_xy = update_trajectories(
+                args, updated_points, estimated_cam_matrix, straight_path, time_session)
+
             # add estimated intrinsics
             # height, width = original_frame.shape[:2]
             # get output from depth model output
@@ -522,21 +601,24 @@ def main() -> int:
             # print(f"estimated_cam_matrix:\n{estimated_cam_matrix}")
             # 5. Render baseline and optimized paths together
 
-            # t0 = time.perf_counter()
-            # resize original frame for visualization
-            original_frame = cv2.resize(original_frame, dsize=(1280, 720), interpolation=cv2.INTER_CUBIC)
-            esdf_surface = visualize_path_esdf(depth=depth, rgb=original_frame,
-                                               result=esdf_result, cam_matrix=cam_matrix,
-                                               T_cam_from_base=T_cam_from_base,
-                                               before_path=init_path_xy, after_path=opt_path_xy,
-                                               idx=frame_idx, args=args)
+            t0 = time.perf_counter()
+            esdf_surface = visualize_static_dynamic_paths(depth=depth, rgb=frame_rgb,
+                                                          dynamic_esdf_result=dynamic_esdf_result,
+                                                          static_esdf_result=static_esdf_result,
+                                                          bbox_result=bbox_result,
+                                                          cam_matrix=cam_matrix,
+                                                          T_cam_from_base=T_cam_from_base,
+                                                          before_path=init_path_xy,
+                                                          static_path=static_path_xy,
+                                                          dynamic_path=dynamic_path_xy,
+                                                          idx=frame_idx, args=args)
             # esdf_surface = debug_visualize(depth=depth, rgb=original_frame,
             #                                    result=esdf_result, cam_matrix=cam_matrix,
             #                                    T_cam_from_base=T_cam_from_base,
             #                                    before_path=init_path_xy, after_path=opt_path_xy,
             #                                    idx=0, args=args)
-            # t1 = time.perf_counter()
-            # print(f"visualize_path_esdf {(t1 - t0) * 1000:.1f} ms")
+            t1 = time.perf_counter()
+            print(f"visualize_path {(t1 - t0) * 1000:.1f} ms")
             # Display FPS
             cv2.putText(esdf_surface,f"FPS: {fps:.1f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
                 1,(0, 255, 0),2)

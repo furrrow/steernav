@@ -3,7 +3,7 @@ entity: JAn
 run_name: steernav
 
 # depth models
-#depth_model_name: "Ruicheng/moge-3-vitl"
 depth_model_name: "Ruicheng/moge-2-vitl-normal"
+vision_model_name: "microsoft/Florence-2-large"
 
 buffer_size: 5

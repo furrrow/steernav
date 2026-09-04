@@ -14,6 +14,8 @@ dependencies = [
     "scipy",
     "timm",
     "einops",
+    "supervision",
+    "ultralytics>=8.4.138",
 ]
 
 [tool.setuptools.packages.find]

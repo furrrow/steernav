@@ -1,8 +1,11 @@
 """
 https://github.com/gershom96/VLA_DataGeneration/blob/main/utils/pointcloud_utils.py
 """
+from __future__ import annotations
+
 import cv2
 import numpy as np
+import supervision as sv
 from scipy.ndimage import distance_transform_edt
 from dataclasses import dataclass
 import time
@@ -1309,3 +1312,84 @@ def pointcloud_to_esdf_pipeline(
         "ground_alignment_correction_R": correction if ground_alignment else np.eye(3, dtype=np.float32),
         "ground_alignment_sensor_origin_xyz": sensor_position,
     }
+
+
+def merge_points(points_input:np.ndarray, projected_patch: np.ndarray,
+                 x1:int, y1:int, x2:int, y2:int):
+    """
+    merge the original point cloud with forward projection of moving obstacles
+    retain whichever point is closer to the camera.
+
+    :param points_input:
+    :param projected_patch:
+    :param x1, y1, x2, y2: bounding box coordinates from moge
+    :return:
+    """
+    merged = points_input.copy()
+    original_patch = merged[y1:y2, x1:x2] # (y, x, 3)
+    result = original_patch.copy()
+
+    original_z = original_patch[..., 2] # (y, x)
+    projected_z = projected_patch[..., 2] # (y, x)
+
+    use_projected = projected_z < original_z
+    result[use_projected] = projected_patch[use_projected]
+
+    merged[y1:y2, x1:x2] = result
+
+    return merged
+
+
+def update_points(points_input, detection_queue: list[sv.Detections],
+                  min_record_num=6, robot_velocity_camera=np.array([0, 0, 0.1]), time_incr=0.1, time_look_ahead=1.0):
+    """
+    inflate detected objects' pointcloudds in the direction of their travel
+    :param points_input:
+    :param detection_queue:
+    :param robot_velocity_camera: in the CAMERA FRAME: x-right, y-down, z-forward
+    :param time_incr: how much time passes between frames. 19fps ~ 0.05
+    :param time_look_ahead:
+    :return:
+    """
+    last_detection = detection_queue[-1]
+    if len(detection_queue) < min_record_num:
+        return points_input
+    if len(last_detection.tracker_id) == 0:
+        return points_input
+
+    for id in last_detection.tracker_id:
+        median_depth_list = []
+        # extract depth of the bounding boxes
+        for i in range(len(detection_queue)):
+            # print(i, detection_queue[i])
+            pos_dict = detection_queue[i].data
+            if id in pos_dict:
+                median_depth_list.append(pos_dict[id])
+        # in case not enough detection on a specific id:
+        if len(median_depth_list) < min_record_num:
+            continue
+        # calculate position change over time
+        median_depth_list = np.array(median_depth_list)
+        changes = np.diff(median_depth_list, axis=0)
+        median_position_shift =np.median(changes, axis=0)
+
+        # extract points from bounding box, project forward to future position
+        last_idx = np.argwhere(last_detection.tracker_id == id)[0][0]
+        x1, y1, x2, y2 = last_detection.xyxy[last_idx].astype(int)
+        box_3d_pts = points_input[y1:y2, x1:x2]
+        observed_velocity = median_position_shift / time_incr
+        relative_velocity = observed_velocity + robot_velocity_camera
+        print(f"\n ----------------- > DEBUG: relative_velocity: {relative_velocity[2]:.2f}\n")
+        if True in np.isnan(relative_velocity):
+            print("nan velocity for position shift:", median_position_shift)
+            continue
+        if relative_velocity[2] > 0: # Object is moving away from camera
+            continue
+        if abs(relative_velocity[2]) < 0.01: # ignore slow moving objects from noise
+            continue
+        future_shift = relative_velocity * time_look_ahead
+        box_project_forward = box_3d_pts + future_shift
+
+        print(f"moving 3d loc by: {np.median(box_3d_pts, axis=(0, 1)) - np.median(box_project_forward, axis=(0, 1))}")
+        points_input = merge_points(points_input, box_project_forward, x1, y1, x2, y2,)
+    return points_input

@@ -69,17 +69,16 @@ class InputStreamHandler:
         video_path: Optional[str] = None,
         webcam_index: int = 0,
         fps_request: int = 0,
-        yarp_port_name: str = "/depthCamera/rgbImage:i",
+        skip_n_fr: int = 1,
     ) -> None:
         self.kind = kind
         self.video_path = video_path
         self.webcam_index = webcam_index
         self.fps_request = fps_request
-        self.yarp_port_name = yarp_port_name
 
         self._cap: Optional[cv2.VideoCapture] = None
-        self._yarp_port = None
-        self._yarp_initialized = False
+        self.skip_n_fr = max(1, skip_n_fr)
+        self.skip_counter = 0
 
     def open(self) -> None:
         kind = self.kind.lower()
@@ -97,77 +96,38 @@ class InputStreamHandler:
             self._cap = cap
             if self.fps_request > 0:
                 cap.set(cv2.CAP_PROP_FPS, self.fps_request)
-        elif kind == "yarp":
-            try:
-                import yarp
-            except ImportError:
-                raise ImportError(
-                    "YARP library is not installed or not found. Please install it to use YARP input source."
-                )
-
-            yarp.Network.init()
-            self._yarp_initialized = True
-            port = yarp.BufferedPortImageRgb()
-            port.open(self.yarp_port_name)
-            print(
-                f"Opened YARP image port at {self.yarp_port_name}. Connect your image source to it"
-            )
-            self._yarp_port = port
         else:
             raise ValueError(f"Unknown source kind: {self.kind}")
 
     def read(self) -> FrameRead:
         """Attempt to read next RGB frame.
-
+        For video/webcam:
+        skip_n_fr=1 -> return every frame
+        skip_n_fr=2 -> return every 2nd frame
+        skip_n_fr=5 -> return every 5th frame
         Returns:
             FrameRead: (status, frame) where frame is present only if status == FrameStatus.OK.
         """
         kind = self.kind.lower()
+        self.skip_counter += 1
         if kind in ("video", "webcam"):
             if self._cap is None:
                 return FrameRead(status=FrameStatus.EOS, frame=None)
             ok, bgr = self._cap.read()
             if not ok:
                 return FrameRead(status=FrameStatus.EOS, frame=None)
+            if self.skip_counter % self.skip_n_fr != 0:
+                return FrameRead(status=FrameStatus.NO_FRAME, frame=None)
             rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
             return FrameRead(status=FrameStatus.OK, frame=rgb)
-        elif kind == "yarp":
-            if self._yarp_port is None:
-                return FrameRead(status=FrameStatus.EOS, frame=None)
-            img_rgb = self._yarp_port.read(False)  # non-blocking
-            if not img_rgb:
-                return FrameRead(status=FrameStatus.NO_FRAME, frame=None)
-            width = img_rgb.width()
-            height = img_rgb.height()
-            char_array_ptr = ctypes.cast(
-                int(img_rgb.getRawImage()), ctypes.POINTER(ctypes.c_char)
-            )
-            bytes_data = ctypes.string_at(char_array_ptr, img_rgb.getRawImageSize())
-            image_array = np.frombuffer(bytes_data, dtype=np.uint8)
-            frame_rgb = image_array.reshape((height, width, 3))
-            return FrameRead(status=FrameStatus.OK, frame=frame_rgb)
         else:
             return FrameRead(status=FrameStatus.EOS, frame=None)
 
     def close(self) -> None:
         kind = self.kind.lower()
-        if kind in ("video", "webcam"):
-            if self._cap is not None:
-                self._cap.release()
-                self._cap = None
-        elif kind == "yarp":
-            if self._yarp_port is not None:
-                try:
-                    self._yarp_port.close()
-                except Exception:
-                    pass
-                self._yarp_port = None
-            if self._yarp_initialized:
-                try:
-                    yarp.Network.fini()
-                except Exception:
-                    pass
-                self._yarp_initialized = False
+        if self._cap is not None:
+            self._cap.release()
+            self._cap = None
 
     # Optional convenience: iterator protocol
     def __enter__(self):
