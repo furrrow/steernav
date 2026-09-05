@@ -46,7 +46,6 @@ class SteeringNode(Node):
         self.waypoint_timestamp_queue = []
 
         # CONSTANTS
-        robot_name = 'ghost'
         parent_dir = "/home/jim/Projects/steernav"
         # parent_dir = "/workspace"
         DEPLOY_CONFIG_PATH = f"{parent_dir}/steernav/config/deployment.yaml"
@@ -57,7 +56,8 @@ class SteeringNode(Node):
             deploy_config = yaml.safe_load(f)
         self.rate = deploy_config["frame_rate"]
         self.waypoint_idx = deploy_config['waypoint_idx']
-        robot_config = deploy_config[robot_name]
+        robot_config = deploy_config[args.robot]
+        print(f"using robot config for: {args.robot}")
         self.max_v = robot_config["max_v"]
         self.max_w = robot_config["max_w"]
         self.original_img_size = (robot_config["img_w"], robot_config["img_h"])  # (1280, 720)
@@ -372,6 +372,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="pipeline to adjust a dummy path accoring to a depth-map ESDF."
     )
+    parser.add_argument("-r", "--robot", type=str, help="Robot Name", default="husky")
     parser.add_argument("--h-min", type=float, default=0.5, help="Minimum kept height in meters.")
     parser.add_argument("--h-max", type=float, default=1.5, help="Maximum kept height in meters.")
     parser.add_argument("--x-min", type=float, default=0.0, help="Minimum forward extent in meters.")

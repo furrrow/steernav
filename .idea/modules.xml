@@ -2,7 +2,6 @@
 <project version="4">
   <component name="ProjectModuleManager">
     <modules>
-      <module fileurl="file://$PROJECT_DIR$/.idea/OnlineVideoDepthAnything.iml" filepath="$PROJECT_DIR$/.idea/OnlineVideoDepthAnything.iml" />
       <module fileurl="file://$PROJECT_DIR$/.idea/custom_utils.iml" filepath="$PROJECT_DIR$/.idea/custom_utils.iml" />
       <module fileurl="file://$PROJECT_DIR$/.idea/moge.iml" filepath="$PROJECT_DIR$/.idea/moge.iml" />
       <module fileurl="file://$PROJECT_DIR$/.idea/steernav.iml" filepath="$PROJECT_DIR$/.idea/steernav.iml" />
