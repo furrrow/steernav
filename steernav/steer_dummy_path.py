@@ -21,7 +21,7 @@ from scipy.spatial import cKDTree
 from moge.model.v2 import MoGeModel
 import supervision as sv
 
-from custom_utils.esdf_utils import visualize_static_dynamic_paths
+from custom_utils.esdf_utils import visualize_static_dynamic_paths, debug_visualize, visualize_path
 from custom_utils.stream_handler import FrameStatus, InputStreamHandler
 from custom_utils.io_utils import save_depth_video_mp4
 from custom_utils.io_utils import load_calibration, filter_unwanted_results
@@ -197,12 +197,10 @@ def esdf_validity_map(mesh: ESDFVisualMesh) -> ValidESDFMesh:
     try:
         from scipy.ndimage import distance_transform_edt
         _dist, nearest = distance_transform_edt(~valid, return_indices=True)
-        nearest_found = True
         nearest_rows = nearest[0].astype(np.int32, copy=False)  # (rows, cols)
         nearest_cols = nearest[1].astype(np.int32, copy=False)  # (rows, cols)
     except Exception:
         warnings.warn("esdf_validity_map failed to find nearest via distance_transform_edt; using KDTree fallback.")
-        nearest_found = False
         valid_rows = np.nonzero(valid)[0].astype(np.int32, copy=False)
         valid_cols = np.nonzero(valid)[1].astype(np.int32, copy=False)
 
@@ -300,7 +298,7 @@ def adam_update_numpy(
         beta1: float = 0.9,
         beta2: float = 0.999,
         eps: float = 1e-8,
-        fix_beginning: bool = True,
+        fix_beginning: bool = False,
         fix_end: bool = False,
 ) -> np.ndarray:
     """
@@ -340,22 +338,21 @@ def adam_update_numpy(
 
         # 5. Parameter Update
         path -= lr * m_hat / (np.sqrt(v_hat) + eps)
-        # path = constrain_xy_to_esdf(path, valid_mesh)
 
-    # filter out waypoints where z-height is positive, indicating obstacle.
+    path = constrain_xy_to_esdf(path, valid_mesh)
+    # filter out waypoints where z-height is negative, indicating navicable points.
     z_scaled, grad_xy, _ = sample_mesh_z_and_gradient(path, valid_mesh, esdf_height_scale)
-    z_mask = np.argwhere(z_scaled > 0)
+    z_mask = np.argwhere(z_scaled < 0)
     # print(f"original path: {path}")
     # print(f"z_scaled: {z_scaled}")
-    if len(z_mask) > 0:
-        last_valid_idx = z_mask[0][0] - 1
-        if last_valid_idx == -1:
-            path = np.zeros_like(path)
-            print("all path below esdf criteria, passing zero paths")
-            print(path)
-        else:
-            path[last_valid_idx + 1:] = path[last_valid_idx]
-            # print(f"constraining path to idx {last_valid_idx} pt: {path[last_valid_idx]}")
+    if len(z_mask) == 0:
+        print(f"z_scaled: {z_scaled}")
+        print("all path below esdf criteria, passing zero paths")
+        path = np.zeros_like(path)
+    elif len(z_mask) < len(z_scaled):
+        last_valid_idx = z_mask[-1][0]
+        path[last_valid_idx + 1:] = path[last_valid_idx]
+        print(f"constraining path to idx {last_valid_idx} pt: {path[last_valid_idx]}")
     return path
 
 
@@ -366,6 +363,7 @@ def update_trajectories(args: Namespace,
                         time_session: bool,
                         n_iter: int = 5,
                         lr: float = 0.1,
+                        free_space_scaling_factor: float=0.25,
                         smooth_weight: float = 0.2,) -> tuple[
     dict[str, Tensor], ndarray, ndarray]:
     t0 = time.perf_counter()
@@ -381,7 +379,7 @@ def update_trajectories(args: Namespace,
         print(f"pointcloud_to_esdf_pipeline {(t1 - t0) * 1000:.1f} ms")
     # ================= from VLA Data Generation pipeline =========================
     mesh = build_esdf_mesh(esdf_raw=esdf_result['esdf'], intrinsics=intrinsics,
-                           args=args, free_space_scaling_factor=0.25)
+                           args=args, free_space_scaling_factor=free_space_scaling_factor)
     valid_mesh = esdf_validity_map(mesh)
     if time_session:
         t2 = time.perf_counter()
@@ -580,15 +578,15 @@ def main() -> int:
             t2 = time.perf_counter()
             print(f"{vision_model_name} inference took {(t2 - t1) * 1000:.1f} ms")
             # 19fps in video, skipping 10 fr, roughly 2fps
-            updated_points = update_points(points_input, detection_queue,
-                                           robot_velocity_camera=np.array([0, 0, 0.1]),
-                                           time_incr=0.5, time_look_ahead=2.0)
+            # updated_points = update_points(points_input, detection_queue,
+            #                                robot_velocity_camera=np.array([0, 0, 0.1]),
+            #                                time_incr=0.5, time_look_ahead=2.0)
 
             static_esdf_result, init_path_xy, static_path_xy = update_trajectories(
                 args, points_input, estimated_cam_matrix, straight_path, time_session)
 
-            dynamic_esdf_result, init_path_xy, dynamic_path_xy = update_trajectories(
-                args, updated_points, estimated_cam_matrix, straight_path, time_session)
+            # dynamic_esdf_result, init_path_xy, dynamic_path_xy = update_trajectories(
+            #     args, updated_points, estimated_cam_matrix, straight_path, time_session)
 
             # add estimated intrinsics
             # height, width = original_frame.shape[:2]
@@ -602,20 +600,28 @@ def main() -> int:
             # 5. Render baseline and optimized paths together
 
             t0 = time.perf_counter()
-            esdf_surface = visualize_static_dynamic_paths(depth=depth, rgb=frame_rgb,
-                                                          dynamic_esdf_result=dynamic_esdf_result,
-                                                          static_esdf_result=static_esdf_result,
+            # esdf_surface = visualize_static_dynamic_paths(depth=depth, rgb=frame_rgb,
+            #                                               dynamic_esdf_result=dynamic_esdf_result,
+            #                                               static_esdf_result=static_esdf_result,
+            #                                               bbox_result=bbox_result,
+            #                                               cam_matrix=cam_matrix,
+            #                                               T_cam_from_base=T_cam_from_base,
+            #                                               before_path=init_path_xy,
+            #                                               static_path=static_path_xy,
+            #                                               dynamic_path=dynamic_path_xy,
+            #                                               idx=frame_idx, args=args)
+            esdf_surface = visualize_path(depth=depth, rgb=frame_rgb,
+                                                          esdf_result=static_esdf_result,
                                                           bbox_result=bbox_result,
                                                           cam_matrix=cam_matrix,
                                                           T_cam_from_base=T_cam_from_base,
                                                           before_path=init_path_xy,
-                                                          static_path=static_path_xy,
-                                                          dynamic_path=dynamic_path_xy,
+                                                          after_path=static_path_xy,
                                                           idx=frame_idx, args=args)
             # esdf_surface = debug_visualize(depth=depth, rgb=original_frame,
-            #                                    result=esdf_result, cam_matrix=cam_matrix,
+            #                                    result=static_esdf_result, cam_matrix=cam_matrix,
             #                                    T_cam_from_base=T_cam_from_base,
-            #                                    before_path=init_path_xy, after_path=opt_path_xy,
+            #                                    before_path=init_path_xy, after_path=static_path_xy,
             #                                    idx=0, args=args)
             t1 = time.perf_counter()
             print(f"visualize_path {(t1 - t0) * 1000:.1f} ms")

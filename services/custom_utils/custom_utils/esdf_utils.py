@@ -422,7 +422,7 @@ def plot_scalar_map_flipped(
     ax.set_aspect("equal", adjustable="box")
     plt.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
 
-custom_cmap = LinearSegmentedColormap.from_list(
+custom_cmap_old = LinearSegmentedColormap.from_list(
     "esdf",
     [
         (0.00, "royalblue"),
@@ -430,6 +430,18 @@ custom_cmap = LinearSegmentedColormap.from_list(
         (0.50, "black"),       # zero
         (0.55, "salmon"),
         (1.00, "crimson"),
+    ],
+)
+custom_cmap = LinearSegmentedColormap.from_list(
+    "esdf_red_focused",
+    [
+        (0.00, "navy"),
+        (0.45, "lightskyblue"),
+        (0.50, "black"),        # Zero marker
+        (0.55, "darkred"),
+        (0.68, "crimson"),
+        (0.82, "darkorange"),
+        (1.00, "yellow"),       # Peak positive value
     ],
 )
 
@@ -601,7 +613,7 @@ def visualize_path(
 
     # 3. Depth map in camera view
     # the depth y-axis are flipped
-    plot_scalar_map(axes[1, 0], depth[::-1, :], extent, "Depth",
+    plot_scalar_map(axes[1, 0], depth[::-1, :], None, "Depth",
                     sensor_xy, cmap="coolwarm", vmin=0, vmax=depth_scale, )
 
     # occupied / free / unknown mixed view:

@@ -1082,13 +1082,6 @@ def compute_esdf_from_occupancy(
 ):
     """
     Compute ESDF/SDF on a 2D grid.
-
-    Positive values are computed only from observed occupied cells, so
-    unknown/FOV-boundary cells do not create artificial positive-distance
-    cliffs inside visible free space. Unknown cells are still marked negative
-    in the signed output, preserving the invariant that ESDF < 0 is invalid
-    or colliding.
-
     Args:
         occupied_mask: bool array, True = occupied
         resolution: meters per grid cell
@@ -1109,29 +1102,35 @@ def compute_esdf_from_occupancy(
     known_free = known & ~occupied
 
     max_distance = float(np.hypot(occupied.shape[0], occupied.shape[1]) * resolution)
+    max_dist_array = np.full(occupied.shape, max_distance, dtype=np.float32)
+    # ESDF calculation for known/free space:
+    occupied_invalid_importance_factor = 0.5 # 1.0 means only consider occupied obstacles & ignore unknown
+    scale = 1.5 # smaller scale -> more aggressive flattening -> follows original path closer
     if np.any(occupied):
-        # distance to nearest observed occupied cell for every cell
-        dist_out = distance_transform_edt(~occupied) * resolution
+        # distance to nearest occupied and/or unknown cell for every cell
+        # dist_out = distance_transform_edt(~occupied) * resolution
+        dist_out = distance_transform_edt(~invalid) * resolution
+        # dist_out = dist_out * occupied_invalid_importance_factor + dist_out_invalid * (1-occupied_invalid_importance_factor)
+        dist_out = max_distance * (1.0 - np.exp(-dist_out / scale))
     else:
         # If no obstacle was observed in the FOV, known-free cells have no
         # obstacle-limited distance inside this map.
-        dist_out = np.full(occupied.shape, max_distance, dtype=np.float32)
-
-    dist_out = dist_out.astype(np.float32)
-    dist_out[invalid] = 0.0
-
-    if not signed:
-        return dist_out.astype(np.float32)
-
-    if np.any(known_free):
-        # distance from invalid cells to nearest known-free cell
-        dist_in = distance_transform_edt(invalid) * resolution
-    else:
-        dist_in = np.full(occupied.shape, max_distance, dtype=np.float32)
+        dist_out = max_dist_array
 
     esdf = dist_out.astype(np.float32)
-    esdf[invalid] = -dist_in[invalid].astype(np.float32)
-    return esdf
+
+    if not signed:
+        esdf[invalid] = 0.0
+        return esdf
+    else:
+        # ESDF calculation for unknown/obstacle space:
+        if np.any(known_free):
+            # distance from invalid cells to nearest known-free cell
+            dist_in = distance_transform_edt(invalid) * resolution
+        else:
+            dist_in = max_dist_array
+        esdf[invalid] = -dist_in[invalid].astype(np.float32)
+        return esdf
 
 
 def inflate_obstacles_via_esdf(esdf, robot_radius):
