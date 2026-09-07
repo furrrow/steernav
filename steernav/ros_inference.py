@@ -47,7 +47,8 @@ class SteeringNode(Node):
 
         # CONSTANTS
         parent_dir = "/home/jim/Projects/steernav"
-        # parent_dir = "/workspace"
+        parent_dir = "/home/gamma-nav/Documents/Projects/git_repos/steernav"
+        # parent_dir = "/workspace/steernav"
         DEPLOY_CONFIG_PATH = f"{parent_dir}/steernav/config/deployment.yaml"
         MODEL_CONFIG_PATH = "config/models.yaml"
         CAMERA_MATRIX_DIR = f"{parent_dir}/steernav/old_cam_matrix.json"
@@ -74,6 +75,8 @@ class SteeringNode(Node):
             self.tf_buffer,
             self,
         )
+        self.inference_count = 0
+        self.inference_start_time = time.perf_counter()
 
         # ROS Topics
         IMAGE_TOPIC = robot_config['image_topic']
@@ -154,7 +157,7 @@ class SteeringNode(Node):
         self.br = CvBridge()
 
     def img_callback_obs(self, msg: Image):
-        self.get_logger().info("Reached Image callback!")
+        # self.get_logger().info("Reached Image callback!")
         if self.compressed_img_topic:
             self.obs_img = self.br.compressed_imgmsg_to_cv2(msg)
         else:
@@ -164,8 +167,8 @@ class SteeringNode(Node):
         # self.obs_img = cv2.cvtColor(self.obs_img, cv2.COLOR_BGR2RGB)
         self.obs_img = PILImage.fromarray(self.obs_img)
         if self.obs_img.size != self.shrink_img_size:
+            # print(f"resizing image from {self.obs_img.size} to {self.shrink_img_size}")
             self.obs_img = self.obs_img.resize(self.shrink_img_size)
-            print(f"resizing image from {self.obs_img.size} to {self.shrink_img_size}")
 
         if self.buffer_size is not None:
             if len(self.image_queue) >= self.buffer_size + 1:
@@ -175,7 +178,7 @@ class SteeringNode(Node):
             self.image_timestamp_queue.append(self.obs_img_timestamp)
 
     def odom_callback_obs(self, msg: Odometry):
-        self.get_logger().info("Reached Odom callback!")
+        # self.get_logger().info("Reached Odom callback!")
         self.robot_velocity_base[:] = [
             msg.twist.twist.linear.x,
             msg.twist.twist.linear.y,
@@ -219,7 +222,7 @@ class SteeringNode(Node):
         ])
 
     def waypoint_callback_obs(self, msg: Path):
-        self.get_logger().info("Reached waypoiont callback!")
+        # self.get_logger().info("Reached waypoiont callback!")
         waypoint_stamp = msg.header.stamp
         waypoints = [
             (
@@ -255,7 +258,7 @@ class SteeringNode(Node):
             closest_idx = self.find_closest_stamp(latest_waypoint_timestamp)
             closest_stamp = self.image_timestamp_queue[closest_idx]
             sec_diff = closest_stamp.sec - latest_waypoint_timestamp.sec + (closest_stamp.nanosec - latest_waypoint_timestamp.nanosec) * 1e-9
-            self.get_logger().info(f"closest_idx {closest_idx}, closest_stamp - latest_waypoint_timestamp: {sec_diff:.6f} sec")
+            # self.get_logger().info(f"closest_idx {closest_idx}, closest_stamp - latest_waypoint_timestamp: {sec_diff:.6f} sec")
 
             obs_image = np.array(self.image_queue[closest_idx])
             input_image = torch.from_numpy(obs_image).to(self.device).permute(2, 0, 1).float().div_(255.0)
@@ -312,14 +315,16 @@ class SteeringNode(Node):
             if len(self.detection_queue) > self.detection_queue_len:
                 self.detection_queue.pop(0)
 
-            robot_velocity_camera = self.get_robot_velocity_camera(
-                "camera_color_optical_frame"
-            )
-            if robot_velocity_camera is None:
-                robot_velocity_camera=np.array([0, 0, 0.0])
-            updated_points = update_points(points_input, self.detection_queue,
-                                           robot_velocity_camera=robot_velocity_camera,
-                                           time_incr=0.5, time_look_ahead=1.0)
+            # robot_velocity_camera = self.get_robot_velocity_camera(
+            #     "camera_color_optical_frame"
+            # )
+            # if robot_velocity_camera is None:
+            #     robot_velocity_camera=np.array([0, 0, 0.0])
+            # update points according to velocity obstacles...
+            # updated_points = update_points(points_input, self.detection_queue,
+            #                                robot_velocity_camera=robot_velocity_camera,
+            #                                time_incr=0.5, time_look_ahead=1.0)
+            updated_points = points_input
 
             esdf_result, init_path_xy, opt_path_xy = update_trajectories(
                 args, updated_points, estimated_cam_matrix, vla_path, time_session=False)
@@ -346,6 +351,19 @@ class SteeringNode(Node):
         waypoint_msg = Float32MultiArray()
         waypoint_msg.data = chosen_waypoint.flatten().tolist()
         self.steered_waypoint_pub.publish(waypoint_msg)
+
+        self.inference_count += 1
+        elapsed = time.perf_counter() - self.inference_start_time
+
+        if elapsed >= 1.0:
+            inference_rate = self.inference_count / elapsed
+            self.get_logger().info(
+                f"Inference rate: {inference_rate:.2f} Hz "
+                f"({self.inference_count} in {elapsed:.2f}s)"
+            )
+
+            self.inference_count = 0
+            self.inference_start_time = time.perf_counter()
         # print(f"image queue {len(self.image_queue)} chosen waypoint: {chosen_waypoint}")
 
         # reached_goal = self.closest_node == self.goal_node
@@ -376,13 +394,13 @@ if __name__ == "__main__":
     parser.add_argument("--h-min", type=float, default=0.5, help="Minimum kept height in meters.")
     parser.add_argument("--h-max", type=float, default=1.5, help="Maximum kept height in meters.")
     parser.add_argument("--x-min", type=float, default=0.0, help="Minimum forward extent in meters.")
-    parser.add_argument("--x-max", type=float, default=15.0, help="Maximum forward extent in meters.")
+    parser.add_argument("--x-max", type=float, default=7.0, help="Maximum forward extent in meters.")
     parser.add_argument("--y-min", type=float, default=-5.0, help="Minimum lateral extent in meters.")
     parser.add_argument("--y-max", type=float, default=5.0, help="Maximum lateral extent in meters.")
     parser.add_argument("--resolution", type=float, default=0.10, help="Grid resolution in meters per cell.")
     parser.add_argument("--sensor-x", type=float, default=0.0, help="Sensor x location in map frame.")
     parser.add_argument("--sensor-y", type=float, default=0.0, help="Sensor y location in map frame.")
-    parser.add_argument("--camera-height", type=float, default=1.0, help="AGL, in meters")
+    parser.add_argument("--camera-height", type=float, default=0.15, help="AGL, in meters")
     parser.add_argument("--img_w", type=int, default=1280, help="resize img width to correctly overlay path")
     parser.add_argument("--img_h", type=int, default=720, help="resize img height to correctly overlay path")
     parser.add_argument("--esdf-height-scale", type=float, default=1.8)
