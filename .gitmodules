@@ -2,3 +2,6 @@
 	path = services/MoGe
 	url = git@github.com:furrrow/MoGe.git
 	branch = custom
+[submodule "services/custom_utils"]
+	path = services/custom_utils
+	url = git@github.com:furrrow/custom_utils.git
