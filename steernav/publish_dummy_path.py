@@ -19,7 +19,7 @@ OVERLAY_TOPIC = "/overlay"
 
 class TestPathPublisher(Node):
 
-    def __init__(self, end_pt):
+    def __init__(self, end_pt, num_points=10):
         super().__init__("test_path_publisher")
 
         self._started_sent = False
@@ -27,6 +27,7 @@ class TestPathPublisher(Node):
         self.robot_velocity_base = np.zeros(3, dtype=np.float64)
         self.robot_angular_velocity_base = np.zeros(3, dtype=np.float64)
         self.end_point = end_pt
+        self.num_points = num_points
         # ROS 2 Topics
         # self.odom_sub = self.create_subscription(
         #     Odometry, ODOM_TOPIC, self.odom_callback_obs,
@@ -39,7 +40,7 @@ class TestPathPublisher(Node):
         #                                                  history=QoSHistoryPolicy.KEEP_LAST,
         #                                                  depth=10))
 
-        self.timer = self.create_timer(0.1, self.publish_path)
+        self.timer = self.create_timer(1, self.publish_path)
         # self.publish_path()
         self.get_logger().info(f"Publishing dummy path on {WAYPOINT_TOPIC}")
 
@@ -86,12 +87,13 @@ class TestPathPublisher(Node):
         now = self.get_clock().now().to_msg()
         path_msg.header.stamp = now
         path_msg.header.frame_id = "base_link"
-        dummy_waypoints, _ = generate_waypoints(self.end_point)
+        flipped_waypoints, _ = generate_waypoints(self.end_point, self.num_points)
+        dummy_waypoints = flipped_waypoints[:, ::-1]
         print(f"end point: {self.end_point}")
         print(f"dummy waypoints: {dummy_waypoints}")
         self.path_pub.publish(self._to_path_msg(dummy_waypoints))
 
-def generate_waypoints(end=(2, 2), n=20, ):
+def generate_waypoints(end=(2, 2), n=8, ):
     # NOTE: we assume robot faces FORWARD. else adjust "forward_distance" logic
     start = np.array([0.0, 0.0])
     end = np.array(end, dtype=float)
@@ -148,11 +150,14 @@ def plot_dummy_path(end_pt):
     plt.show()
 
 def main(args=None):
-    end_point = (0, 2)
-    plot_dummy_path(end_point)
+    forward, left = 10, 0
+    end_point = (left, forward)
+    # plot dummy path uses x-axis as left-right, y-axis as forward;
+    # this is flipped before settin as waypoints in TestPathPublisher
+    # plot_dummy_path(end_point)
 
     rclpy.init(args=args)
-    node = TestPathPublisher(end_point)
+    node = TestPathPublisher(end_point, 30)
 
     try:
         rclpy.spin(node)

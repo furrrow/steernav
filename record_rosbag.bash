@@ -18,15 +18,17 @@ echo "Recording rosbag: $OUTPUT_NAME"
 
 ros2 bag record \
 	-o "$OUTPUT_NAME" \
-	/odom_lidar \
-	/os_cloud_node/metadata \
-	/os_cloud_node/os_driver/transition_event \
-	/os_cloud_node/points_shm \
-	/os_cloud_node/points \
-	/mcu/state/imu \
-	/mcu/command/manual_twist \
-	/camera/camera/color/image_raw \
+	/a200_0648/cmd_vel \
+	/a200_0648/platform/odom/filtered \
+	/husky/policy_path \
+	/husky/waypoint \
+	/husky/steered_waypoint \
+	/camera/camera/color/image_raw/compressed \
 	/camera/camera/color/camera_info \
+	/path \
+	/started \
+	/next_goal \
+	/req_goal \
 	/tf \
 	/tf_static \
 

@@ -28,7 +28,7 @@ husky:
   image_topic: "/camera/camera/color/image_raw/compressed"
 #  image_topic: "/camera/camera/color/image_raw"
   waypoint_topic: "/husky/waypoint"
-  odom_topic: "/a200_0648/platform/odom/filtered"
+  odom_topic: "/a200_0648/platform/odom"
   policy_path_topic: "/husky/policy_path"
   steered_waypoint_topic: "/husky/steered_waypoint"
   goal_topic: "/next_goal"
@@ -45,5 +45,5 @@ shrink_h: 480
 # observation rate for the robot
 frame_rate: 15
 controller_rate: 10
-waypoint_idx : 0
+waypoint_idx : 2
 cam_matrix: "cam_matrix.json"

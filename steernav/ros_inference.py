@@ -174,7 +174,7 @@ class SteeringNode(Node):
             self.obs_img = self.br.imgmsg_to_cv2(msg)
         # Original camera timestamp
         self.obs_img_timestamp = msg.header.stamp
-        # self.obs_img = cv2.cvtColor(self.obs_img, cv2.COLOR_BGR2RGB)
+        self.obs_img = cv2.cvtColor(self.obs_img, cv2.COLOR_BGR2RGB)
         self.obs_img = PILImage.fromarray(self.obs_img)
         if self.obs_img.size != self.shrink_img_size:
             # print(f"resizing image from {self.obs_img.size} to {self.shrink_img_size}")
@@ -336,7 +336,7 @@ class SteeringNode(Node):
                     valid_pts = pts_flat[valid_mask]  # (N, 3)
                     median_3d = np.median(valid_pts, axis=0)
                     pos_dict[id] = median_3d
-                    print(f"detect id {id} median loc: {median_3d}")
+                    # print(f"detect id {id} median loc: {median_3d}")
                 # coopting the data field since it is unused.
                 detections.data = pos_dict
                 # pred_color = plot_bbox(frame_rgb, bbox_result, detections.tracker_id, show_plot=False, return_img=True)
@@ -393,7 +393,7 @@ class SteeringNode(Node):
 
         waypoint_msg = Float32MultiArray()
         waypoint_msg.data = chosen_waypoint.flatten().tolist()
-        # self.steered_waypoint_pub.publish(waypoint_msg)
+        self.steered_waypoint_pub.publish(waypoint_msg)
 
         self.inference_count += 1
         elapsed = time.perf_counter() - self.inference_start_time
