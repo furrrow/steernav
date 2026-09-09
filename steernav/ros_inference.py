@@ -17,12 +17,12 @@ from torch import Tensor
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Image, CompressedImage
-from std_msgs.msg import Bool, Float32MultiArray
+from std_msgs.msg import Bool, Float32MultiArray, Empty
 from nav_msgs.msg import Path, Odometry
 from rclpy.qos import QoSProfile
 from rclpy.qos import QoSReliabilityPolicy, QoSHistoryPolicy
 import tf2_ros
-from geometry_msgs.msg import Vector3Stamped
+from geometry_msgs.msg import Vector3Stamped, PoseStamped
 
 from custom_utils.esdf_utils import visualize_path, debug_visualize
 from custom_utils.io_utils import load_calibration, filter_unwanted_results
@@ -47,12 +47,11 @@ class SteeringNode(Node):
 
         # CONSTANTS
         parent_dir = "/home/jim/Projects/steernav"
-        parent_dir = "/home/gamma-nav/Documents/Projects/git_repos/steernav"
+        # parent_dir = "/home/gamma-nav/Documents/Projects/git_repos/steernav"
         # parent_dir = "/workspace/steernav"
-        DEPLOY_CONFIG_PATH = f"{parent_dir}/steernav/config/deployment.yaml"
+        DEPLOY_CONFIG_PATH = f"{parent_dir}/steernav/config/robot.yaml"
         MODEL_CONFIG_PATH = "config/models.yaml"
-        CAMERA_MATRIX_DIR = f"{parent_dir}/steernav/old_cam_matrix.json"
-        self.distance_cutoff = 10
+        CAMERA_MATRIX_DIR = f"{parent_dir}/steernav/cam_matrix.json"
         with open(DEPLOY_CONFIG_PATH, "r") as f:
             deploy_config = yaml.safe_load(f)
         self.rate = deploy_config["frame_rate"]
@@ -61,8 +60,8 @@ class SteeringNode(Node):
         print(f"using robot config for: {args.robot}")
         self.max_v = robot_config["max_v"]
         self.max_w = robot_config["max_w"]
-        self.original_img_size = (robot_config["img_w"], robot_config["img_h"])  # (1280, 720)
-        self.shrink_img_size = (robot_config["shrink_w"], robot_config["shrink_h"])  # (640, 480)
+        self.original_img_size = (deploy_config["img_w"], deploy_config["img_h"])  # (1280, 720)
+        self.shrink_img_size = (deploy_config["shrink_w"], deploy_config["shrink_h"])  # (640, 480)
         self.detection_queue = []
         self.detection_queue_len = 20
         self.robot_velocity_base = np.zeros(3, dtype=np.float64)
@@ -144,7 +143,9 @@ class SteeringNode(Node):
             Image, OVERLAY_TOPIC, qos_profile=QoSProfile(reliability=QoSReliabilityPolicy.RELIABLE,
                                                          history=QoSHistoryPolicy.KEEP_LAST,
                                                          depth=10))
-        self.goal_pub = self.create_publisher(Bool, REACHED_GOAL_TOPIC, 1)
+        # self.goal_pub = self.create_publisher(Bool, REACHED_GOAL_TOPIC, 1)
+        self.pub_started = self.create_publisher(Empty, "/started", 10)
+        self.pub_path = self.create_publisher(Path, "/path", 10)
         self.timer = self.create_timer(1.0 / self.rate, lambda: self.run_steering_loop(args))
 
         # self.imsave_timer = self.create_timer(1, lambda: self.save_images_and_actions())
@@ -250,9 +251,26 @@ class SteeringNode(Node):
         closest_idx = np.argmin(np.abs(timestamp_diff))
         return closest_idx
 
+    def _to_path_msg(self, path_xy: np.ndarray) -> Path:
+        msg = Path()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = self.path_frame_id  # semantic: "start frame"
+
+        for x, y in path_xy:
+            ps = PoseStamped()
+            ps.header = msg.header
+            ps.pose.position.x = float(x)
+            ps.pose.position.y = float(y)
+            ps.pose.position.z = 0.0
+            ps.pose.orientation.w = 1.0
+            msg.poses.append(ps)
+
+        return msg
+
     def run_steering_loop(self, args):
         chosen_waypoint = np.zeros(2)
         if (len(self.image_queue) > self.buffer_size) and (len(self.waypoint_queue) > 0):
+            t0 = time.perf_counter()
             latest_waypoint_timestamp = self.waypoint_timestamp_queue[-1]
             last_waypoint = self.waypoint_queue[-1]
             closest_idx = self.find_closest_stamp(latest_waypoint_timestamp)
@@ -270,6 +288,8 @@ class SteeringNode(Node):
             points_input = moge_points.astype(np.float32, copy=True)
             points_input[~depth_model_output["mask"].cpu().numpy().astype(bool)] = np.nan
             depth = depth_model_output['depth'].cpu().numpy()
+            t1 = time.perf_counter()
+            self.get_logger().info(f"depth_model inference took {(t1 - t0) * 1000:.1f} ms")
 
             obj_detect_inputs = (self.processor(text=self.prompt, images=obs_image, return_tensors="pt")
                                  .to(self.device, self.torch_dtype))
@@ -287,6 +307,9 @@ class SteeringNode(Node):
             bbox_result = obj_detect_result[self.task_prompt]
             bbox_result = filter_unwanted_results(bbox_result, obs_image.shape[1], obs_image.shape[0])
             bbox_only = [bbox for bbox, label in zip(bbox_result['bboxes'], bbox_result['labels'])]
+            t2 = time.perf_counter()
+            self.get_logger().info(f"obj_detect_result took {(t2 - t1) * 1000:.1f} ms")
+
             if len(bbox_only) > 0:
                 dummy_confidence = np.ones(len(bbox_only)) * 0.7
                 sv_detection = sv.Detections(xyxy=np.array(bbox_only), confidence=dummy_confidence)
@@ -314,7 +337,8 @@ class SteeringNode(Node):
             self.detection_queue.append(detections)
             if len(self.detection_queue) > self.detection_queue_len:
                 self.detection_queue.pop(0)
-
+            t3 = time.perf_counter()
+            self.get_logger().info(f"tracker update took {(t3 - t2) * 1000:.1f} ms")
             # robot_velocity_camera = self.get_robot_velocity_camera(
             #     "camera_color_optical_frame"
             # )
@@ -333,6 +357,8 @@ class SteeringNode(Node):
                                             interpolation=cv2.INTER_CUBIC)
             else:
                 original_frame = obs_image
+            t4 = time.perf_counter()
+            self.get_logger().info(f"update_trajectories took {(t4 - t3) * 1000:.1f} ms")
             esdf_surface = visualize_path(depth=depth, rgb=obs_image,
                                           esdf_result=esdf_result, bbox_result=bbox_result,
                                           cam_matrix=self.cam_matrix,
@@ -346,11 +372,14 @@ class SteeringNode(Node):
             #                                    idx=0, args=args)
             out_msg = self.br.cv2_to_imgmsg(np.array(esdf_surface), encoding="rgb8")
             self.trajectory_visual_pub.publish(out_msg)
+            self.pub_path.publish(self._to_path_msg(opt_path_xy))
             chosen_waypoint = opt_path_xy[self.waypoint_idx]
+            t5 = time.perf_counter()
+            self.get_logger().info(f"visualize + publish path took {(t5 - t4) * 1000:.1f} ms")
 
         waypoint_msg = Float32MultiArray()
         waypoint_msg.data = chosen_waypoint.flatten().tolist()
-        self.steered_waypoint_pub.publish(waypoint_msg)
+        # self.steered_waypoint_pub.publish(waypoint_msg)
 
         self.inference_count += 1
         elapsed = time.perf_counter() - self.inference_start_time
@@ -388,7 +417,7 @@ def main(args: argparse.Namespace):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="pipeline to adjust a dummy path accoring to a depth-map ESDF."
+        description="ros inference pipeline according to a depth-map ESDF."
     )
     parser.add_argument("-r", "--robot", type=str, help="Robot Name", default="husky")
     parser.add_argument("--h-min", type=float, default=0.5, help="Minimum kept height in meters.")

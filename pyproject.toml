@@ -18,9 +18,6 @@ dependencies = [
     "ultralytics>=8.4.138",
 ]
 
-[tool.setuptools.packages.find]
-where = ["src"] # Tells setuptools where to find steernav source code
-
 [tool.uv.sources]
 moge = { workspace = true }
 custom_utils = { workspace = true }
