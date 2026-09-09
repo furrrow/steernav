@@ -19,8 +19,7 @@ from rclpy.node import Node
 from sensor_msgs.msg import Image, CompressedImage
 from std_msgs.msg import Bool, Float32MultiArray, Empty
 from nav_msgs.msg import Path, Odometry
-from rclpy.qos import QoSProfile
-from rclpy.qos import QoSReliabilityPolicy, QoSHistoryPolicy
+from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
 import tf2_ros
 from geometry_msgs.msg import Vector3Stamped, PoseStamped
 
@@ -46,8 +45,8 @@ class SteeringNode(Node):
         self.waypoint_timestamp_queue = []
 
         # CONSTANTS
-        parent_dir = "/home/jim/Projects/steernav"
-        # parent_dir = "/home/gamma-nav/Documents/Projects/git_repos/steernav"
+        # parent_dir = "/home/jim/Projects/steernav"
+        parent_dir = "/home/gamma-nav/Documents/Projects/git_repos/steernav"
         # parent_dir = "/workspace/steernav"
         DEPLOY_CONFIG_PATH = f"{parent_dir}/steernav/config/robot.yaml"
         MODEL_CONFIG_PATH = "config/models.yaml"
@@ -68,6 +67,9 @@ class SteeringNode(Node):
         self.robot_angular_velocity_base = np.zeros(3, dtype=np.float64)
         self.dt = 1 / self.rate
         self.reached_goal = False
+        self.path_frame_id = "base_link"
+        self._started_sent = False
+        self.show_time_performance = False
 
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(
@@ -156,6 +158,13 @@ class SteeringNode(Node):
 
         self.closest_node = 0
         self.br = CvBridge()
+        # Publish /started once, when we actually start inferencing
+        if not self._started_sent:
+            self._started_sent = True
+            self._have_cur_img = False
+            self._have_cur_pose = False
+            self.pub_started.publish(Empty())
+            self.get_logger().info("Published /started (once).")
 
     def img_callback_obs(self, msg: Image):
         # self.get_logger().info("Reached Image callback!")
@@ -288,8 +297,9 @@ class SteeringNode(Node):
             points_input = moge_points.astype(np.float32, copy=True)
             points_input[~depth_model_output["mask"].cpu().numpy().astype(bool)] = np.nan
             depth = depth_model_output['depth'].cpu().numpy()
-            t1 = time.perf_counter()
-            self.get_logger().info(f"depth_model inference took {(t1 - t0) * 1000:.1f} ms")
+            if self.show_time_performance:
+                t1 = time.perf_counter()
+                self.get_logger().info(f" === > depth_model inference took {(t1 - t0) * 1000:.1f} ms")
 
             obj_detect_inputs = (self.processor(text=self.prompt, images=obs_image, return_tensors="pt")
                                  .to(self.device, self.torch_dtype))
@@ -307,8 +317,9 @@ class SteeringNode(Node):
             bbox_result = obj_detect_result[self.task_prompt]
             bbox_result = filter_unwanted_results(bbox_result, obs_image.shape[1], obs_image.shape[0])
             bbox_only = [bbox for bbox, label in zip(bbox_result['bboxes'], bbox_result['labels'])]
-            t2 = time.perf_counter()
-            self.get_logger().info(f"obj_detect_result took {(t2 - t1) * 1000:.1f} ms")
+            if self.show_time_performance:
+                t2 = time.perf_counter()
+                self.get_logger().info(f"obj_detect_result took {(t2 - t1) * 1000:.1f} ms")
 
             if len(bbox_only) > 0:
                 dummy_confidence = np.ones(len(bbox_only)) * 0.7
@@ -337,8 +348,9 @@ class SteeringNode(Node):
             self.detection_queue.append(detections)
             if len(self.detection_queue) > self.detection_queue_len:
                 self.detection_queue.pop(0)
-            t3 = time.perf_counter()
-            self.get_logger().info(f"tracker update took {(t3 - t2) * 1000:.1f} ms")
+            if self.show_time_performance:
+                t3 = time.perf_counter()
+                self.get_logger().info(f"tracker update took {(t3 - t2) * 1000:.1f} ms")
             # robot_velocity_camera = self.get_robot_velocity_camera(
             #     "camera_color_optical_frame"
             # )
@@ -357,8 +369,9 @@ class SteeringNode(Node):
                                             interpolation=cv2.INTER_CUBIC)
             else:
                 original_frame = obs_image
-            t4 = time.perf_counter()
-            self.get_logger().info(f"update_trajectories took {(t4 - t3) * 1000:.1f} ms")
+            if self.show_time_performance:
+                t4 = time.perf_counter()
+                self.get_logger().info(f"update_trajectories took {(t4 - t3) * 1000:.1f} ms")
             esdf_surface = visualize_path(depth=depth, rgb=obs_image,
                                           esdf_result=esdf_result, bbox_result=bbox_result,
                                           cam_matrix=self.cam_matrix,
@@ -374,8 +387,9 @@ class SteeringNode(Node):
             self.trajectory_visual_pub.publish(out_msg)
             self.pub_path.publish(self._to_path_msg(opt_path_xy))
             chosen_waypoint = opt_path_xy[self.waypoint_idx]
-            t5 = time.perf_counter()
-            self.get_logger().info(f"visualize + publish path took {(t5 - t4) * 1000:.1f} ms")
+            if self.show_time_performance:
+                t5 = time.perf_counter()
+                self.get_logger().info(f"visualize + publish path took {(t5 - t4) * 1000:.1f} ms")
 
         waypoint_msg = Float32MultiArray()
         waypoint_msg.data = chosen_waypoint.flatten().tolist()

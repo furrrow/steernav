@@ -23,8 +23,8 @@ ghost:
   overlay_topic: "/ghost/path_overlay"
   robot_radius: 0.2
 husky:
-  max_v: 0.1 # m/s
-  max_w: 0.1 # rad/s
+  max_v: 0.2 # m/s
+  max_w: 0.3 # rad/s
   image_topic: "/camera/camera/color/image_raw/compressed"
 #  image_topic: "/camera/camera/color/image_raw"
   waypoint_topic: "/husky/waypoint"
