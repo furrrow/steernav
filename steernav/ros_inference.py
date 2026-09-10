@@ -12,7 +12,8 @@ from transformers import AutoProcessor, AutoModelForCausalLM
 
 from PIL import Image as PILImage
 from torch import Tensor
-
+import threading
+from queue import Queue, Full, Empty
 # ROS2
 import rclpy
 from rclpy.node import Node
@@ -30,7 +31,7 @@ import matplotlib
 matplotlib.use("Agg")
 from moge.model.v2 import MoGeModel
 import supervision as sv
-from steer_dummy_path import update_trajectories
+from steer_dummy_path import update_trajectories, transform_point
 from custom_utils.pointcloud_utils import update_points
 
 
@@ -45,8 +46,8 @@ class SteeringNode(Node):
         self.waypoint_timestamp_queue = []
 
         # CONSTANTS
-        # parent_dir = "/home/jim/Projects/steernav"
-        parent_dir = "/home/gamma-nav/Documents/Projects/git_repos/steernav"
+        parent_dir = "/home/jim/Projects/steernav"
+        # parent_dir = "/home/gamma-nav/Documents/Projects/git_repos/steernav"
         # parent_dir = "/workspace/steernav"
         DEPLOY_CONFIG_PATH = f"{parent_dir}/steernav/config/robot.yaml"
         MODEL_CONFIG_PATH = "config/models.yaml"
@@ -59,6 +60,7 @@ class SteeringNode(Node):
         print(f"using robot config for: {args.robot}")
         self.max_v = robot_config["max_v"]
         self.max_w = robot_config["max_w"]
+        args.robot_radius=robot_config["robot_radius"]
         self.original_img_size = (deploy_config["img_w"], deploy_config["img_h"])  # (1280, 720)
         self.shrink_img_size = (deploy_config["shrink_w"], deploy_config["shrink_h"])  # (640, 480)
         self.detection_queue = []
@@ -70,6 +72,7 @@ class SteeringNode(Node):
         self.path_frame_id = "base_link"
         self._started_sent = False
         self.show_time_performance = False
+        self.visualize = True
 
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(
@@ -201,34 +204,41 @@ class SteeringNode(Node):
             msg.twist.twist.angular.z,
         ]
 
-    def get_robot_velocity_camera(self, camera_frame):
+    # def get_robot_velocity_camera(self, camera_frame):
+    #
+    #     velocity = Vector3Stamped()
+    #
+    #     velocity.header.frame_id = "base_link"
+    #     velocity.header.stamp = self.get_clock().now().to_msg()
+    #
+    #     velocity.vector.x = self.robot_velocity_base[0]
+    #     velocity.vector.y = self.robot_velocity_base[1]
+    #     velocity.vector.z = self.robot_velocity_base[2]
+    #
+    #     try:
+    #         velocity_camera = self.tf_buffer.transform(
+    #             velocity,
+    #             camera_frame,
+    #             timeout=rclpy.duration.Duration(seconds=0.1),
+    #         )
+    #
+    #     except Exception as e:
+    #         self.get_logger().warn(
+    #             f"Could not transform robot velocity to camera frame: {e}"
+    #         )
+    #         return None
+    #
+    #     return np.array([
+    #         velocity_camera.vector.x,
+    #         velocity_camera.vector.y,
+    #         velocity_camera.vector.z,
+    #     ])
 
-        velocity = Vector3Stamped()
-
-        velocity.header.frame_id = "base_link"
-        velocity.header.stamp = self.get_clock().now().to_msg()
-
-        velocity.vector.x = self.robot_velocity_base[0]
-        velocity.vector.y = self.robot_velocity_base[1]
-        velocity.vector.z = self.robot_velocity_base[2]
-
-        try:
-            velocity_camera = self.tf_buffer.transform(
-                velocity,
-                camera_frame,
-                timeout=rclpy.duration.Duration(seconds=0.1),
-            )
-
-        except Exception as e:
-            self.get_logger().warn(
-                f"Could not transform robot velocity to camera frame: {e}"
-            )
-            return None
-
+    def get_linear_velocity(self):
         return np.array([
-            velocity_camera.vector.x,
-            velocity_camera.vector.y,
-            velocity_camera.vector.z,
+            self.robot_velocity_base[0],
+            self.robot_velocity_base[1],
+            self.robot_velocity_base[2],
         ])
 
     def waypoint_callback_obs(self, msg: Path):
@@ -351,45 +361,46 @@ class SteeringNode(Node):
             if self.show_time_performance:
                 t3 = time.perf_counter()
                 self.get_logger().info(f"tracker update took {(t3 - t2) * 1000:.1f} ms")
-            # robot_velocity_camera = self.get_robot_velocity_camera(
-            #     "camera_color_optical_frame"
-            # )
-            # if robot_velocity_camera is None:
-            #     robot_velocity_camera=np.array([0, 0, 0.0])
+            # robot_velocity_camera = self.get_robot_velocity_camera("camera_color_optical_frame")
+            robot_velocity_camera = self.get_linear_velocity()
+            if robot_velocity_camera is None:
+                robot_velocity_camera=np.array([0, 0, 0.0])
+            self.get_logger().info(f"robot_velocity_camera: {robot_velocity_camera}")
             # update points according to velocity obstacles...
-            # updated_points = update_points(points_input, self.detection_queue,
-            #                                robot_velocity_camera=robot_velocity_camera,
-            #                                time_incr=0.5, time_look_ahead=1.0)
-            updated_points = points_input
+            updated_points, point_movement_cam = update_points(points_input, self.detection_queue,
+                                           robot_velocity_camera=robot_velocity_camera,
+                                           time_incr=0.5, time_look_ahead=1.0)
+            point_movement_bev = [
+                (
+                    transform_point(self.T_base_from_cam, prev_point),
+                    transform_point(self.T_base_from_cam, after_point),
+                )
+                for prev_point, after_point in point_movement_cam
+            ]
 
             esdf_result, init_path_xy, opt_path_xy = update_trajectories(
                 args, updated_points, estimated_cam_matrix, vla_path, time_session=False)
-            if self.original_img_size != self.shrink_img_size:
-                original_frame = cv2.resize(obs_image, dsize=self.original_img_size,
-                                            interpolation=cv2.INTER_CUBIC)
-            else:
-                original_frame = obs_image
             if self.show_time_performance:
                 t4 = time.perf_counter()
                 self.get_logger().info(f"update_trajectories took {(t4 - t3) * 1000:.1f} ms")
-            esdf_surface = visualize_path(depth=depth, rgb=obs_image,
-                                          esdf_result=esdf_result, bbox_result=bbox_result,
-                                          cam_matrix=self.cam_matrix,
-                                          T_cam_from_base=self.T_cam_from_base,
-                                          before_path=init_path_xy, after_path=opt_path_xy,
-                                          idx=0, args=args)
-            # esdf_surface = debug_visualize(depth=depth, rgb=original_frame,
-            #                                    result=esdf_result, cam_matrix=self.cam_matrix,
-            #                                    T_cam_from_base=self.T_cam_from_base,
-            #                                    before_path=init_path_xy, after_path=opt_path_xy,
-            #                                    idx=0, args=args)
-            out_msg = self.br.cv2_to_imgmsg(np.array(esdf_surface), encoding="rgb8")
-            self.trajectory_visual_pub.publish(out_msg)
+
             self.pub_path.publish(self._to_path_msg(opt_path_xy))
             chosen_waypoint = opt_path_xy[self.waypoint_idx]
-            if self.show_time_performance:
-                t5 = time.perf_counter()
-                self.get_logger().info(f"visualize + publish path took {(t5 - t4) * 1000:.1f} ms")
+
+            # visualization code
+            if self.visualize:
+                esdf_surface = visualize_path(depth=depth, rgb=obs_image,
+                                              esdf_result=esdf_result, bbox_result=bbox_result,
+                                              cam_matrix=self.cam_matrix,
+                                              T_cam_from_base=self.T_cam_from_base,
+                                              before_path=init_path_xy, after_path=opt_path_xy,
+                                              point_movement_bev=point_movement_bev,
+                                              args=args)
+                out_msg = self.br.cv2_to_imgmsg(np.array(esdf_surface), encoding="rgb8")
+                self.trajectory_visual_pub.publish(out_msg)
+                if self.show_time_performance:
+                    t5 = time.perf_counter()
+                    self.get_logger().info(f"visualize + publish path took {(t5 - t4) * 1000:.1f} ms")
 
         waypoint_msg = Float32MultiArray()
         waypoint_msg.data = chosen_waypoint.flatten().tolist()

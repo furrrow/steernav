@@ -16,6 +16,7 @@ dependencies = [
     "einops",
     "supervision",
     "ultralytics>=8.4.138",
+    "opencv-python",
 ]
 
 [tool.uv.sources]

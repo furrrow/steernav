@@ -100,9 +100,10 @@ class ValidESDFMesh(ESDFVisualMesh):
             nearest_cols=nearest_cols,
         )
 
-def build_esdf_mesh(esdf_raw, intrinsics, args: argparse.Namespace, free_space_scaling_factor=1.0) -> ESDFVisualMesh:
+def build_esdf_mesh(esdf_raw, intrinsics, args: argparse.Namespace, free_space_scaling_factor=1.0, ) -> ESDFVisualMesh:
     x_min, x_max = args.x_min, args.x_max
     y_min, y_max = args.y_min, args.y_max
+    robot_radius = args.robot_radius
     esdf_raw = np.asarray(esdf_raw, dtype=np.float32)
     finite_raw = esdf_raw[np.isfinite(esdf_raw)]
     fallback = 0.0 if finite_raw.size == 0 else float(np.median(finite_raw))
@@ -118,8 +119,9 @@ def build_esdf_mesh(esdf_raw, intrinsics, args: argparse.Namespace, free_space_s
             esdf = gaussian_filter(esdf, sigma=smooth_sigma)
         except Exception:
             pass
-    color_scale = min(finite_abs_percentile(esdf, float(args.esdf_projected_color_percentile)), raw_abs_scale)
-    signed = resize_esdf_for_surface(esdf, max_cols=420)
+    clearance_esdf = esdf - robot_radius
+    color_scale = min(finite_abs_percentile(clearance_esdf, float(args.esdf_projected_color_percentile)), raw_abs_scale)
+    signed = resize_esdf_for_surface(clearance_esdf, max_cols=420)
     rows = np.linspace(0.0, 1.0, signed.shape[0], dtype=np.float32)
     cols = np.linspace(0.0, 1.0, signed.shape[1], dtype=np.float32)
     cc, rr = np.meshgrid(cols, rows)
@@ -134,7 +136,7 @@ def build_esdf_mesh(esdf_raw, intrinsics, args: argparse.Namespace, free_space_s
     mesh = ESDFVisualMesh(
         x=base_x,
         y=base_y,
-        esdf=esdf,
+        esdf=clearance_esdf,
         z_height=z_height,
         z_color=z_color,
         color_scale=color_scale,
@@ -352,7 +354,7 @@ def adam_update_numpy(
     elif len(z_mask) < len(z_scaled):
         last_valid_idx = z_mask[-1][0]
         path[last_valid_idx + 1:] = path[last_valid_idx]
-        print(f"constraining path to idx {last_valid_idx} pt: {path[last_valid_idx]}")
+        # print(f"constraining path to idx {last_valid_idx} pt: {path[last_valid_idx]}")
     return path
 
 
@@ -373,13 +375,14 @@ def update_trajectories(args: Namespace,
                                               R=rotation, t=translation,
                                               x_min=args.x_min, x_max=args.x_max,
                                               y_min=args.y_min, y_max=args.y_max,
+                                              robot_radius=args.robot_radius,
                                               )
     if time_session:
         t1 = time.perf_counter()
         print(f"pointcloud_to_esdf_pipeline {(t1 - t0) * 1000:.1f} ms")
     # ================= from VLA Data Generation pipeline =========================
     mesh = build_esdf_mesh(esdf_raw=esdf_result['esdf'], intrinsics=intrinsics,
-                           args=args, free_space_scaling_factor=free_space_scaling_factor)
+                           args=args, free_space_scaling_factor=free_space_scaling_factor,)
     valid_mesh = esdf_validity_map(mesh)
     if time_session:
         t2 = time.perf_counter()
@@ -398,6 +401,11 @@ def update_trajectories(args: Namespace,
         print(f"total time before rendering {(t3 - t0) * 1000:.1f} ms")
     return esdf_result, init_path_xy, opt_path_xy
 
+def transform_point(T_base_from_cam: np.ndarray, point_cam: np.ndarray) -> np.ndarray:
+    point_h = np.append(point_cam, 1.0)   # [x, y, z, 1]
+    point_base_h = T_base_from_cam @ point_h
+    return point_base_h[:3]
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="pipeline to adjust a dummy path accoring to a depth-map ESDF."
@@ -405,15 +413,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--h-min", type=float, default=0.5, help="Minimum kept height in meters.")
     parser.add_argument("--h-max", type=float, default=1.5, help="Maximum kept height in meters.")
     parser.add_argument("--x-min", type=float, default=0.0, help="Minimum forward extent in meters.")
-    parser.add_argument("--x-max", type=float, default=10.0, help="Maximum forward extent in meters.")
+    parser.add_argument("--x-max", type=float, default=7.0, help="Maximum forward extent in meters.")
     parser.add_argument("--y-min", type=float, default=-5.0, help="Minimum lateral extent in meters.")
     parser.add_argument("--y-max", type=float, default=5.0, help="Maximum lateral extent in meters.")
     parser.add_argument("--resolution", type=float, default=0.10, help="Grid resolution in meters per cell.")
     parser.add_argument("--sensor-x", type=float, default=0.0, help="Sensor x location in map frame.")
     parser.add_argument("--sensor-y", type=float, default=0.0, help="Sensor y location in map frame.")
-    parser.add_argument("--camera-height", type=float, default=1.0, help="AGL, in meters")
+    parser.add_argument("--camera-height", type=float, default=0.15, help="AGL, in meters")
     parser.add_argument("--img_w", type=int, default=1280, help="resize img width to correctly overlay path")
     parser.add_argument("--img_h", type=int, default=720, help="resize img height to correctly overlay path")
+    parser.add_argument("--robot-radius", type=float, default=1.0)
     parser.add_argument("--esdf-height-scale", type=float, default=1.8)
     parser.add_argument("--esdf-height-clip-m", type=float, default=2.0)
     parser.add_argument("--esdf-projected-smooth-sigma", type=float, default=1.5)
@@ -430,11 +439,11 @@ def main() -> int:
     # video_path = "/home/jim/Projects/steernav/assets/Cars_and_Gasstation.mp4"
     # video_path = "/home/jim/Projects/steernav/assets/jim_flownav_test.mp4"
     video_path = "/home/jim/Projects/steernav/assets/corridoor_omni_ft_2_left.mp4"
-    camera_matrix_dir = "old_cam_matrix.json"
+    # video_path = "/home/jim/Projects/steernav/assets/close_up_bug_20260909_114902.mp4"
+    camera_matrix_dir = "cam_matrix.json"
     # camera_matrix_dir = "ghost_fl_cam_matrix.json"
     output_folder = "demo_video"
     webcam_index = 0
-    yarp_port = "/sam3/rgbImage:i"
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     # Load model
@@ -578,15 +587,21 @@ def main() -> int:
             t2 = time.perf_counter()
             print(f"{vision_model_name} inference took {(t2 - t1) * 1000:.1f} ms")
             # 19fps in video, skipping 10 fr, roughly 2fps
-            # updated_points = update_points(points_input, detection_queue,
-            #                                robot_velocity_camera=np.array([0, 0, 0.1]),
-            #                                time_incr=0.5, time_look_ahead=2.0)
-
+            updated_points, point_movement_cam = update_points(points_input, detection_queue,
+                                                           robot_velocity_camera=np.array([0, 0, 0.0]),
+                                                           time_incr=0.5, time_look_ahead=2.0)
+            point_movement_bev = [
+                (
+                    transform_point(T_base_from_cam, prev_point),
+                    transform_point(T_base_from_cam, after_point),
+                )
+                for prev_point, after_point in point_movement_cam
+            ]
             static_esdf_result, init_path_xy, static_path_xy = update_trajectories(
                 args, points_input, estimated_cam_matrix, straight_path, time_session)
 
-            # dynamic_esdf_result, init_path_xy, dynamic_path_xy = update_trajectories(
-            #     args, updated_points, estimated_cam_matrix, straight_path, time_session)
+            dynamic_esdf_result, init_path_xy, dynamic_path_xy = update_trajectories(
+                args, updated_points, estimated_cam_matrix, straight_path, time_session)
 
             # add estimated intrinsics
             # height, width = original_frame.shape[:2]
@@ -609,15 +624,17 @@ def main() -> int:
             #                                               before_path=init_path_xy,
             #                                               static_path=static_path_xy,
             #                                               dynamic_path=dynamic_path_xy,
-            #                                               idx=frame_idx, args=args)
+            #                                               point_movement_bev=point_movement_bev,
+            #                                               args=args)
             esdf_surface = visualize_path(depth=depth, rgb=frame_rgb,
-                                                          esdf_result=static_esdf_result,
+                                                          esdf_result=dynamic_esdf_result,
                                                           bbox_result=bbox_result,
                                                           cam_matrix=cam_matrix,
                                                           T_cam_from_base=T_cam_from_base,
                                                           before_path=init_path_xy,
                                                           after_path=static_path_xy,
-                                                          idx=frame_idx, args=args)
+                                                          point_movement_bev=point_movement_bev,
+                                                          args=args)
             # esdf_surface = debug_visualize(depth=depth, rgb=original_frame,
             #                                    result=static_esdf_result, cam_matrix=cam_matrix,
             #                                    T_cam_from_base=T_cam_from_base,

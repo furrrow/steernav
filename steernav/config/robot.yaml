@@ -21,14 +21,14 @@ ghost:
   sampled_actions_topic: "/ghost/sampled_actions"
   vel_topic: "  /mcu/command/manual_twist"
   overlay_topic: "/ghost/path_overlay"
-  robot_radius: 0.2
+  robot_radius: 0.5
 husky:
   max_v: 0.2 # m/s
   max_w: 0.3 # rad/s
   image_topic: "/camera/camera/color/image_raw/compressed"
 #  image_topic: "/camera/camera/color/image_raw"
   waypoint_topic: "/husky/waypoint"
-  odom_topic: "/a200_0648/platform/odom"
+  odom_topic: "/a200_0648/platform/odom/filtered"
   policy_path_topic: "/husky/policy_path"
   steered_waypoint_topic: "/husky/steered_waypoint"
   goal_topic: "/next_goal"
@@ -36,7 +36,7 @@ husky:
   sampled_actions_topic: "/husky/sampled_actions"
   vel_topic: "/a200_0648/cmd_vel"
   overlay_topic: "/husky/path_overlay"
-  robot_radius: 0.5
+  robot_radius: 1.0
 # general configs
 img_w: 1280
 img_h: 720
