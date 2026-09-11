@@ -4,6 +4,7 @@ run_name: steernav
 
 # depth models
 depth_model_name: "Ruicheng/moge-2-vitl-normal"
-vision_model_name: "microsoft/Florence-2-large"
+#vision_model_name: "microsoft/Florence-2-large"
+vision_model_name: "microsoft/Florence-2-base-ft"
 
 buffer_size: 5
