@@ -1,7 +1,13 @@
 from __future__ import annotations
+import matplotlib
+matplotlib.use("Agg")
+
 import time
 import argparse
 from argparse import Namespace
+from concurrent.futures import ThreadPoolExecutor, wait
+from contextlib import nullcontext
+from pathlib import Path as FilePath
 
 import cv2
 from cv_bridge import CvBridge
@@ -27,8 +33,6 @@ from geometry_msgs.msg import Vector3Stamped, PoseStamped
 from custom_utils.esdf_utils import visualize_esdf, debug_visualize, visualize_path_only
 from custom_utils.io_utils import load_calibration, filter_unwanted_results
 
-import matplotlib
-matplotlib.use("Agg")
 from moge.model.v2 import MoGeModel
 import supervision as sv
 from steer_dummy_path import update_trajectories, transform_point
@@ -46,11 +50,12 @@ class SteeringNode(Node):
         self.waypoint_timestamp_queue = []
 
         # CONSTANTS
-        parent_dir = "/home/jim/Projects/steernav"
+        parent_dir = FilePath(__file__).resolve().parent.parent
+        # parent_dir = "/home/jim/Projects/steernav"
         # parent_dir = "/home/gamma-nav/Documents/Projects/git_repos/steernav"
         # parent_dir = "/workspace/steernav"
         DEPLOY_CONFIG_PATH = f"{parent_dir}/steernav/config/robot.yaml"
-        MODEL_CONFIG_PATH = "config/models.yaml"
+        MODEL_CONFIG_PATH = f"{parent_dir}/steernav/config/models.yaml"
         CAMERA_MATRIX_DIR = f"{parent_dir}/steernav/cam_matrix.json"
         with open(DEPLOY_CONFIG_PATH, "r") as f:
             deploy_config = yaml.safe_load(f)
@@ -116,6 +121,21 @@ class SteeringNode(Node):
         self.text_prompt = "people"
         self.prompt = self.task_prompt + self.text_prompt
         self.tracker = sv.ByteTrack()
+
+        self.inference_executor = None
+        self.depth_stream = None
+        self.bbox_stream = None
+        if args.parallel_inference and self.device.type == "cuda":
+            self.get_logger().info("Using Parallel inference.")
+            self.depth_stream = torch.cuda.Stream(device=self.device)
+            self.bbox_stream = torch.cuda.Stream(device=self.device)
+            # Model weights were loaded on the current stream; workers must wait for them.
+            model_stream = torch.cuda.current_stream(self.device)
+            self.depth_stream.wait_stream(model_stream)
+            self.bbox_stream.wait_stream(model_stream)
+            self.inference_executor = ThreadPoolExecutor(max_workers=2)
+        elif args.parallel_inference:
+            self.get_logger().warn("Parallel inference requires CUDA; using serial inference.")
 
         # ROS 2 Topics
         # subscribers:
@@ -268,6 +288,50 @@ class SteeringNode(Node):
 
         return msg
 
+    def destroy_node(self):
+        self.timer.cancel()
+        if self.inference_executor is not None:
+            self.inference_executor.shutdown(wait=True)
+            self.inference_executor = None
+        return super().destroy_node()
+
+    def _infer_depth(self, obs_image):
+        context = torch.cuda.stream(self.depth_stream) if self.depth_stream is not None else nullcontext()
+        with context:
+            input_image = torch.from_numpy(obs_image).to(self.device).permute(2, 0, 1).float().div_(255.0)
+            depth_model_output = self.depth_model.infer(input_image) #First big blocker
+            if self.depth_stream is not None:
+                self.depth_stream.synchronize()
+            moge_points = depth_model_output['points'].cpu().numpy()
+            estimated_cam_matrix = depth_model_output['intrinsics'].cpu().numpy()
+            points_input = moge_points.astype(np.float32, copy=True)
+            points_input[~depth_model_output["mask"].cpu().numpy().astype(bool)] = np.nan
+            depth = depth_model_output['depth'].cpu().numpy()
+        return points_input, estimated_cam_matrix, depth
+
+    def _infer_bboxes(self, obs_image):
+        context = torch.cuda.stream(self.bbox_stream) if self.bbox_stream is not None else nullcontext()
+        with context:
+            obj_detect_inputs = (self.processor(text=self.prompt, images=obs_image, return_tensors="pt")
+                                 .to(self.device, self.torch_dtype))
+            generated_ids = self.obj_detect_model.generate(
+                input_ids=obj_detect_inputs["input_ids"],
+                pixel_values=obj_detect_inputs["pixel_values"],
+                max_new_tokens=4096,
+                num_beams=3,
+                do_sample=False
+            )
+            if self.bbox_stream is not None:
+                self.bbox_stream.synchronize()
+            generated_text = self.processor.batch_decode(generated_ids, skip_special_tokens=False)[0]
+
+            obj_detect_result = self.processor.post_process_generation(generated_text, task=self.task_prompt,
+                                                                  image_size=(obs_image.shape[1], obs_image.shape[0]))
+            bbox_result = obj_detect_result[self.task_prompt] #Second big blocker
+            bbox_result = filter_unwanted_results(bbox_result, obs_image.shape[1], obs_image.shape[0])
+            bbox_only = [bbox for bbox, label in zip(bbox_result['bboxes'], bbox_result['labels'])]
+        return bbox_result, bbox_only
+
     def run_steering_loop(self, args):
         chosen_waypoint = np.zeros(2)
         if (len(self.image_queue) > self.buffer_size) and (len(self.waypoint_queue) > 0):
@@ -280,38 +344,27 @@ class SteeringNode(Node):
             # self.get_logger().info(f"closest_idx {closest_idx}, closest_stamp - latest_waypoint_timestamp: {sec_diff:.6f} sec")
 
             obs_image = np.array(self.image_queue[closest_idx])
-            input_image = torch.from_numpy(obs_image).to(self.device).permute(2, 0, 1).float().div_(255.0)
             vla_path = np.array(last_waypoint)
 
-            depth_model_output = self.depth_model.infer(input_image)
-            moge_points = depth_model_output['points'].cpu().numpy()
-            estimated_cam_matrix = depth_model_output['intrinsics'].cpu().numpy()
-            points_input = moge_points.astype(np.float32, copy=True)
-            points_input[~depth_model_output["mask"].cpu().numpy().astype(bool)] = np.nan
-            depth = depth_model_output['depth'].cpu().numpy()
-            if self.show_time_performance:
-                t1 = time.perf_counter()
-                self.get_logger().info(f" === > depth_model inference took {(t1 - t0) * 1000:.1f} ms")
-
-            obj_detect_inputs = (self.processor(text=self.prompt, images=obs_image, return_tensors="pt")
-                                 .to(self.device, self.torch_dtype))
-            generated_ids = self.obj_detect_model.generate(
-                input_ids=obj_detect_inputs["input_ids"],
-                pixel_values=obj_detect_inputs["pixel_values"],
-                max_new_tokens=4096,
-                num_beams=3,
-                do_sample=False
-            )
-            generated_text = self.processor.batch_decode(generated_ids, skip_special_tokens=False)[0]
-
-            obj_detect_result = self.processor.post_process_generation(generated_text, task=self.task_prompt,
-                                                                  image_size=(obs_image.shape[1], obs_image.shape[0]))
-            bbox_result = obj_detect_result[self.task_prompt]
-            bbox_result = filter_unwanted_results(bbox_result, obs_image.shape[1], obs_image.shape[0])
-            bbox_only = [bbox for bbox, label in zip(bbox_result['bboxes'], bbox_result['labels'])]
+            if self.inference_executor is not None:
+                depth_future = self.inference_executor.submit(self._infer_depth, obs_image)
+                bbox_future = self.inference_executor.submit(self._infer_bboxes, obs_image)
+                # Finish both workers before advancing this frame, even if one failed.
+                wait((depth_future, bbox_future))
+                points_input, estimated_cam_matrix, depth = depth_future.result()
+                bbox_result, bbox_only = bbox_future.result()
+                torch.cuda.synchronize(self.device)
+            else:
+                points_input, estimated_cam_matrix, depth = self._infer_depth(obs_image)
+                if self.show_time_performance:
+                    t1 = time.perf_counter()
+                    self.get_logger().info(f" === > depth_model inference took {(t1 - t0) * 1000:.1f} ms")
+                bbox_result, bbox_only = self._infer_bboxes(obs_image)
+                if self.show_time_performance:
+                    self.get_logger().info(f"obj_detect_result took {(time.perf_counter() - t1) * 1000:.1f} ms")
             if self.show_time_performance:
                 t2 = time.perf_counter()
-                self.get_logger().info(f"obj_detect_result took {(t2 - t1) * 1000:.1f} ms")
+                self.get_logger().info(f"depth + bbox inference took {(t2 - t0) * 1000:.1f} ms")
 
             if len(bbox_only) > 0:
                 dummy_confidence = np.ones(len(bbox_only)) * 0.7
@@ -435,13 +488,19 @@ def main(args: argparse.Namespace):
         pass
     finally:
         steering_node.destroy_node()
-        rclpy.shutdown()
+        import matplotlib.pyplot as plt
+        plt.close("all")
+
+        if rclpy.ok():
+            rclpy.shutdown()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="ros inference pipeline according to a depth-map ESDF."
     )
     parser.add_argument("-r", "--robot", type=str, help="Robot Name", default="husky")
+    parser.add_argument("--parallel-inference", type=bool, default=1,
+                        help="Run depth and bounding-box inference concurrently on separate CUDA streams.")
     parser.add_argument("--h-min", type=float, default=0.5, help="Minimum kept height in meters.")
     parser.add_argument("--h-max", type=float, default=1.5, help="Maximum kept height in meters.")
     parser.add_argument("--x-min", type=float, default=0.0, help="Minimum forward extent in meters.")

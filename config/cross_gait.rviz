@@ -1,0 +1,73 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+  - Class: rviz_common/Views
+    Name: Views
+Visualization Manager:
+  Class: ""
+  Enabled: true
+  Global Options:
+    Background Color: 48; 48; 48
+    Fixed Frame: base_link
+    Frame Rate: 30
+  Displays:
+    - Class: rviz_default_plugins/Grid
+      Name: Grid
+      Enabled: true
+      Cell Size: 1
+      Plane: XY
+      Plane Cell Count: 20
+      Reference Frame: <Fixed Frame>
+    - Class: rviz_default_plugins/Image
+      Name: Camera
+      Enabled: true
+      Topic:
+        Value: /camera/camera/color/image_raw
+        Reliability Policy: Best Effort
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Depth: 5
+    - Class: rviz_default_plugins/Image
+      Name: Steering visualization
+      Enabled: true
+      Topic:
+        Value: /ghost/path_overlay
+        Reliability Policy: Reliable
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Depth: 5
+    - Class: rviz_default_plugins/Path
+      Name: Input path
+      Enabled: true
+      Color: 255; 80; 80
+      Topic:
+        Value: /ghost/policy_path
+        Reliability Policy: Reliable
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Depth: 5
+    - Class: rviz_default_plugins/Path
+      Name: Optimized path
+      Enabled: true
+      Color: 80; 255; 80
+      Topic:
+        Value: /path
+        Reliability Policy: Reliable
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Depth: 5
+  Tools:
+    - Class: rviz_default_plugins/Interact
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_default_plugins/Select
+  Views:
+    Current:
+      Class: rviz_default_plugins/TopDownOrtho
+      Name: Current View
+      Target Frame: <Fixed Frame>
+      Scale: 60
+      X: 4
+      Y: 0
+Window Geometry:
+  Width: 1440
+  Height: 900
