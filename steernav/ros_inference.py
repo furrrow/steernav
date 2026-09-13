@@ -24,7 +24,7 @@ from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
 import tf2_ros
 from geometry_msgs.msg import Vector3Stamped, PoseStamped
 
-from custom_utils.esdf_utils import visualize_path, debug_visualize
+from custom_utils.esdf_utils import visualize_esdf, debug_visualize, visualize_path_only
 from custom_utils.io_utils import load_calibration, filter_unwanted_results
 
 import matplotlib
@@ -46,8 +46,8 @@ class SteeringNode(Node):
         self.waypoint_timestamp_queue = []
 
         # CONSTANTS
-        # parent_dir = "/home/jim/Projects/steernav"
-        parent_dir = "/home/gamma-nav/Documents/Projects/git_repos/steernav"
+        parent_dir = "/home/jim/Projects/steernav"
+        # parent_dir = "/home/gamma-nav/Documents/Projects/git_repos/steernav"
         # parent_dir = "/workspace/steernav"
         DEPLOY_CONFIG_PATH = f"{parent_dir}/steernav/config/robot.yaml"
         MODEL_CONFIG_PATH = "config/models.yaml"
@@ -71,7 +71,7 @@ class SteeringNode(Node):
         self.reached_goal = False
         self.path_frame_id = "base_link"
         self._started_sent = False
-        self.show_time_performance = False
+        self.show_time_performance = True
         self.visualize = True
 
         self.tf_buffer = tf2_ros.Buffer()
@@ -88,9 +88,9 @@ class SteeringNode(Node):
         self.compressed_img_topic = True if "compressed" in IMAGE_TOPIC else False
         print(f"IMAGE_TOPIC: {IMAGE_TOPIC} compressed_img_topic: {self.compressed_img_topic}")
         POLICY_PATH_TOPIC = robot_config['policy_path_topic']
+        STEERED_PATH_TOPIC = robot_config['steered_path_topic']
         STEERED_WAYPOINT_TOPIC = robot_config['steered_waypoint_topic']
         SAMPLED_ACTIONS_TOPIC = robot_config['sampled_actions_topic']
-        REACHED_GOAL_TOPIC = robot_config['reached_goal_topic']
         OVERLAY_TOPIC = robot_config['overlay_topic']
 
         # load model parameters
@@ -118,6 +118,7 @@ class SteeringNode(Node):
         self.tracker = sv.ByteTrack()
 
         # ROS 2 Topics
+        # subscribers:
         msg_type = CompressedImage if self.compressed_img_topic else Image
         self.image_sub = self.create_subscription(
             msg_type, IMAGE_TOPIC, self.img_callback_obs,
@@ -129,8 +130,14 @@ class SteeringNode(Node):
             qos_profile=QoSProfile(reliability=QoSReliabilityPolicy.RELIABLE,
                                    history=QoSHistoryPolicy.KEEP_LAST,
                                    depth=10))
-        self.policy_waypoint_sub = self.create_subscription(
-            Path, POLICY_PATH_TOPIC, self.waypoint_callback_obs,
+        self.policy_path_sub = self.create_subscription(
+            Path, POLICY_PATH_TOPIC, self.path_callback_obs,
+            qos_profile=QoSProfile(reliability=QoSReliabilityPolicy.RELIABLE,
+                                   history=QoSHistoryPolicy.KEEP_LAST,
+                                   depth=10))
+        # publishers:
+        self.steered_path_pub = self.create_publisher(
+            Path, STEERED_PATH_TOPIC,
             qos_profile=QoSProfile(reliability=QoSReliabilityPolicy.RELIABLE,
                                    history=QoSHistoryPolicy.KEEP_LAST,
                                    depth=10))
@@ -150,7 +157,10 @@ class SteeringNode(Node):
                                                          depth=10))
         # self.goal_pub = self.create_publisher(Bool, REACHED_GOAL_TOPIC, 1)
         self.pub_started = self.create_publisher(Empty, "/started", 10)
-        self.pub_path = self.create_publisher(Path, "/path", 10)
+        self.pub_path = self.create_publisher(Path, STEERED_PATH_TOPIC,
+                                              qos_profile=QoSProfile(reliability=QoSReliabilityPolicy.RELIABLE,
+                                                                     history=QoSHistoryPolicy.KEEP_LAST,
+                                                                     depth=10))
         self.timer = self.create_timer(1.0 / self.rate, lambda: self.run_steering_loop(args))
 
         # self.imsave_timer = self.create_timer(1, lambda: self.save_images_and_actions())
@@ -204,36 +214,6 @@ class SteeringNode(Node):
             msg.twist.twist.angular.z,
         ]
 
-    # def get_robot_velocity_camera(self, camera_frame):
-    #
-    #     velocity = Vector3Stamped()
-    #
-    #     velocity.header.frame_id = "base_link"
-    #     velocity.header.stamp = self.get_clock().now().to_msg()
-    #
-    #     velocity.vector.x = self.robot_velocity_base[0]
-    #     velocity.vector.y = self.robot_velocity_base[1]
-    #     velocity.vector.z = self.robot_velocity_base[2]
-    #
-    #     try:
-    #         velocity_camera = self.tf_buffer.transform(
-    #             velocity,
-    #             camera_frame,
-    #             timeout=rclpy.duration.Duration(seconds=0.1),
-    #         )
-    #
-    #     except Exception as e:
-    #         self.get_logger().warn(
-    #             f"Could not transform robot velocity to camera frame: {e}"
-    #         )
-    #         return None
-    #
-    #     return np.array([
-    #         velocity_camera.vector.x,
-    #         velocity_camera.vector.y,
-    #         velocity_camera.vector.z,
-    #     ])
-
     def get_linear_velocity(self):
         return np.array([
             self.robot_velocity_base[0],
@@ -241,8 +221,8 @@ class SteeringNode(Node):
             self.robot_velocity_base[2],
         ])
 
-    def waypoint_callback_obs(self, msg: Path):
-        # self.get_logger().info("Reached waypoiont callback!")
+    def path_callback_obs(self, msg: Path):
+        # self.get_logger().info("Reached path_callback_obs")
         waypoint_stamp = msg.header.stamp
         waypoints = [
             (
@@ -270,9 +250,11 @@ class SteeringNode(Node):
         closest_idx = np.argmin(np.abs(timestamp_diff))
         return closest_idx
 
-    def _to_path_msg(self, path_xy: np.ndarray) -> Path:
+    def _to_path_msg(self, path_xy: np.ndarray, stamp=None) -> Path:
         msg = Path()
-        msg.header.stamp = self.get_clock().now().to_msg()
+        if stamp is None:
+            stamp = self.get_clock().now().to_msg()
+        msg.header.stamp = stamp
         msg.header.frame_id = self.path_frame_id  # semantic: "start frame"
 
         for x, y in path_xy:
@@ -384,18 +366,33 @@ class SteeringNode(Node):
                 t4 = time.perf_counter()
                 self.get_logger().info(f"update_trajectories took {(t4 - t3) * 1000:.1f} ms")
 
-            self.pub_path.publish(self._to_path_msg(opt_path_xy))
+            self.steered_path_pub.publish(self._to_path_msg(opt_path_xy, stamp=latest_waypoint_timestamp))
             chosen_waypoint = opt_path_xy[self.waypoint_idx]
 
             # visualization code
             if self.visualize:
-                esdf_surface = visualize_path(depth=depth, rgb=obs_image,
-                                              esdf_result=esdf_result, bbox_result=bbox_result,
-                                              cam_matrix=self.cam_matrix,
-                                              T_cam_from_base=self.T_cam_from_base,
+                # visualize only esdf, ~ 150ms
+                esdf_surface = visualize_esdf(esdf_result=esdf_result,
                                               before_path=init_path_xy, after_path=opt_path_xy,
                                               point_movement_bev=point_movement_bev,
                                               args=args)
+                # visualize path only, ~200ms
+                # esdf_surface = visualize_path_only(depth=depth, rgb=obs_image,
+                #                                    esdf_result=esdf_result, bbox_result=bbox_result,
+                #                                    cam_matrix=self.cam_matrix,
+                #                                    T_cam_from_base=self.T_cam_from_base,
+                #                                    before_path=init_path_xy, after_path=opt_path_xy,
+                #                                    point_movement_bev=point_movement_bev,
+                #                                    args=args)
+                # visualize full quad chart, ~ 500ms
+                # esdf_surface = visualize_path_debug(depth=depth, rgb=obs_image,
+                #                                     esdf_result=esdf_result, bbox_result=bbox_result,
+                #                                     cam_matrix=self.cam_matrix,
+                #                                     T_cam_from_base=self.T_cam_from_base,
+                #                                     before_path=init_path_xy, after_path=opt_path_xy,
+                #                                     point_movement_bev=point_movement_bev,
+                #                                     args=args)
+
                 out_msg = self.br.cv2_to_imgmsg(np.array(esdf_surface), encoding="rgb8")
                 self.trajectory_visual_pub.publish(out_msg)
                 if self.show_time_performance:

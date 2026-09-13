@@ -21,7 +21,7 @@ from scipy.spatial import cKDTree
 from moge.model.v2 import MoGeModel
 import supervision as sv
 
-from custom_utils.esdf_utils import visualize_static_dynamic_paths, debug_visualize, visualize_path
+from custom_utils.esdf_utils import visualize_static_dynamic_paths, debug_visualize, visualize_esdf
 from custom_utils.stream_handler import FrameStatus, InputStreamHandler
 from custom_utils.io_utils import save_depth_video_mp4
 from custom_utils.io_utils import load_calibration, filter_unwanted_results
@@ -626,15 +626,15 @@ def main() -> int:
             #                                               dynamic_path=dynamic_path_xy,
             #                                               point_movement_bev=point_movement_bev,
             #                                               args=args)
-            esdf_surface = visualize_path(depth=depth, rgb=frame_rgb,
-                                                          esdf_result=dynamic_esdf_result,
-                                                          bbox_result=bbox_result,
-                                                          cam_matrix=cam_matrix,
-                                                          T_cam_from_base=T_cam_from_base,
-                                                          before_path=init_path_xy,
-                                                          after_path=static_path_xy,
-                                                          point_movement_bev=point_movement_bev,
-                                                          args=args)
+            esdf_surface = visualize_esdf(depth=depth, rgb=frame_rgb,
+                                          esdf_result=dynamic_esdf_result,
+                                          bbox_result=bbox_result,
+                                          cam_matrix=cam_matrix,
+                                          T_cam_from_base=T_cam_from_base,
+                                          before_path=init_path_xy,
+                                          after_path=static_path_xy,
+                                          point_movement_bev=point_movement_bev,
+                                          args=args)
             # esdf_surface = debug_visualize(depth=depth, rgb=original_frame,
             #                                    result=static_esdf_result, cam_matrix=cam_matrix,
             #                                    T_cam_from_base=T_cam_from_base,

@@ -12,16 +12,17 @@ turtle:
 ghost:
   max_v: 0.2 # m/s
   max_w: 0.3 # rad/s
-#  image_topic: "/camera/camera/color/image_raw/compressed"
-  image_topic: "/camera/camera/color/image_raw"
+  image_topic: "/camera/camera/color/image_raw/compressed"
+#  image_topic: "/camera/camera/color/image_raw"
   odom_topic: "/odom_lidar"
   policy_path_topic: "/ghost/policy_path"
+  steered_path_topic: "/ghost/steered_path"
   steered_waypoint_topic: "/ghost/steered_waypoint"
   reached_goal_topic: "/ghost/topoplan/reached_goal"
   sampled_actions_topic: "/ghost/sampled_actions"
   vel_topic: "  /mcu/command/manual_twist"
   overlay_topic: "/ghost/path_overlay"
-  robot_radius: 0.5
+  robot_radius: 0.75
 husky:
   max_v: 0.2 # m/s
   max_w: 0.3 # rad/s
@@ -30,6 +31,7 @@ husky:
   waypoint_topic: "/husky/waypoint"
   odom_topic: "/a200_0648/platform/odom/filtered"
   policy_path_topic: "/husky/policy_path"
+  steered_path_topic: "/husky/steered_path"
   steered_waypoint_topic: "/husky/steered_waypoint"
   goal_topic: "/next_goal"
   reached_goal_topic: "/husky/topoplan/reached_goal"
@@ -45,6 +47,7 @@ jackal:
   waypoint_topic: "/jackal/waypoint"
   odom_topic: "/j100_0707/platform/odom/filtered"
   policy_path_topic: "/jackal/policy_path"
+  steered_path_topic: "/jackal/steered_path"
   steered_waypoint_topic: "/jackal/steered_waypoint"
   goal_topic: "/next_goal"
   reached_goal_topic: "/jackal/topoplan/reached_goal"
@@ -57,6 +60,7 @@ img_w: 1280
 img_h: 720
 shrink_w: 640
 shrink_h: 480
+overlay_topic: "/path_overlay"
 # observation rate for the robot
 frame_rate: 15
 controller_rate: 10
