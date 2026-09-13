@@ -34,6 +34,7 @@ import supervision as sv
 from steer_dummy_path import update_trajectories, transform_point
 from custom_utils.pointcloud_utils import update_points
 
+#this is owen's version of the steering node implementation
 
 class SteeringNode(Node):
     def __init__(self, args: argparse.Namespace):
