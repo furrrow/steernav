@@ -46,7 +46,7 @@ class SteeringNode(Node):
         self.buffer_size = None
         self.image_queue = []
         self.image_timestamp_queue = []
-        self.waypoint_queue = []
+        self.paths_queue = []
         self.waypoint_timestamp_queue = []
 
         # CONSTANTS
@@ -76,7 +76,7 @@ class SteeringNode(Node):
         self.reached_goal = False
         self.path_frame_id = "base_link"
         self._started_sent = False
-        self.show_time_performance = True
+        self.show_time_performance = False
         self.visualize = True
 
         self.tf_buffer = tf2_ros.Buffer()
@@ -242,20 +242,32 @@ class SteeringNode(Node):
         ])
 
     def path_callback_obs(self, msg: Path):
-        # self.get_logger().info("Reached path_callback_obs")
         waypoint_stamp = msg.header.stamp
-        waypoints = [
-            (
-                pose_stamped.pose.position.x,
-                pose_stamped.pose.position.y
-            )
-            for pose_stamped in msg.poses
-        ]
+        waypoints = []
+        for pose_stamped in msg.poses:
+            pose = pose_stamped.pose
+
+            x = pose.position.x
+            y = pose.position.y
+
+            qz = pose.orientation.z
+            qw = pose.orientation.w
+
+            # quaternion -> yaw
+            yaw = 2.0 * np.arctan2(qz, qw)
+
+            # yaw -> heading vector
+            hx = np.cos(yaw)
+            hy = np.sin(yaw)
+
+            waypoints.append((x, y, hx, hy))
+
         if self.buffer_size is not None:
-            if len(self.waypoint_queue) >= self.buffer_size + 1:
-                self.waypoint_queue.pop(0)
+            if len(self.paths_queue) >= self.buffer_size + 1:
+                self.paths_queue.pop(0)
                 self.waypoint_timestamp_queue.pop(0)
-            self.waypoint_queue.append(np.array(waypoints))
+
+            self.paths_queue.append(np.array(waypoints))
             self.waypoint_timestamp_queue.append(waypoint_stamp)
 
     def find_closest_stamp(self, target_stamp):
@@ -334,134 +346,138 @@ class SteeringNode(Node):
 
     def run_steering_loop(self, args):
         chosen_waypoint = np.zeros(2)
-        if (len(self.image_queue) > self.buffer_size) and (len(self.waypoint_queue) > 0):
+        if (len(self.image_queue) > self.buffer_size) and (len(self.paths_queue) > 0):
             t0 = time.perf_counter()
             latest_waypoint_timestamp = self.waypoint_timestamp_queue[-1]
-            last_waypoint = self.waypoint_queue[-1]
+            last_path = self.paths_queue[-1]
             closest_idx = self.find_closest_stamp(latest_waypoint_timestamp)
             closest_stamp = self.image_timestamp_queue[closest_idx]
             sec_diff = closest_stamp.sec - latest_waypoint_timestamp.sec + (closest_stamp.nanosec - latest_waypoint_timestamp.nanosec) * 1e-9
             # self.get_logger().info(f"closest_idx {closest_idx}, closest_stamp - latest_waypoint_timestamp: {sec_diff:.6f} sec")
-
-            obs_image = np.array(self.image_queue[closest_idx])
-            vla_path = np.array(last_waypoint)
-
-            if self.inference_executor is not None:
-                depth_future = self.inference_executor.submit(self._infer_depth, obs_image)
-                bbox_future = self.inference_executor.submit(self._infer_bboxes, obs_image)
-                # Finish both workers before advancing this frame, even if one failed.
-                wait((depth_future, bbox_future))
-                points_input, estimated_cam_matrix, depth = depth_future.result()
-                bbox_result, bbox_only = bbox_future.result()
-                torch.cuda.synchronize(self.device)
+            self.get_logger().info(f"last path: {last_path}")
+            if last_path[self.waypoint_idx][0] == 0 and last_path[self.waypoint_idx][1] == 0:
+                self.get_logger().info(f"received pure rotation command: {last_path[self.waypoint_idx]}")
+                chosen_waypoint = last_path[self.waypoint_idx]
             else:
-                points_input, estimated_cam_matrix, depth = self._infer_depth(obs_image)
+                obs_image = np.array(self.image_queue[closest_idx])
+                vla_path = np.array(last_path)
+
+                if self.inference_executor is not None:
+                    depth_future = self.inference_executor.submit(self._infer_depth, obs_image)
+                    bbox_future = self.inference_executor.submit(self._infer_bboxes, obs_image)
+                    # Finish both workers before advancing this frame, even if one failed.
+                    wait((depth_future, bbox_future))
+                    points_input, estimated_cam_matrix, depth = depth_future.result()
+                    bbox_result, bbox_only = bbox_future.result()
+                    torch.cuda.synchronize(self.device)
+                else:
+                    points_input, estimated_cam_matrix, depth = self._infer_depth(obs_image)
+                    if self.show_time_performance:
+                        t1 = time.perf_counter()
+                        self.get_logger().info(f" === > depth_model inference took {(t1 - t0) * 1000:.1f} ms")
+                    bbox_result, bbox_only = self._infer_bboxes(obs_image)
+                    if self.show_time_performance:
+                        self.get_logger().info(f"obj_detect_result took {(time.perf_counter() - t1) * 1000:.1f} ms")
                 if self.show_time_performance:
-                    t1 = time.perf_counter()
-                    self.get_logger().info(f" === > depth_model inference took {(t1 - t0) * 1000:.1f} ms")
-                bbox_result, bbox_only = self._infer_bboxes(obs_image)
+                    t2 = time.perf_counter()
+                    self.get_logger().info(f"=== >  depth + bbox inference took {(t2 - t0) * 1000:.1f} ms")
+
+                if len(bbox_only) > 0:
+                    dummy_confidence = np.ones(len(bbox_only)) * 0.7
+                    sv_detection = sv.Detections(xyxy=np.array(bbox_only), confidence=dummy_confidence)
+                    detections = self.tracker.update_with_detections(sv_detection)
+                    pos_dict = {}
+                    for box, id in zip(detections.xyxy, detections.tracker_id):
+                        x1, y1, x2, y2 = box
+                        # update box size
+                        box_width = x2 - x1
+                        box_height = y2 - y1
+
+                        x1 += 0.10 * box_width
+                        x2 -= 0.10 * box_width
+                        y1 += 0.10 * box_height
+                        y2 -= 0.10 * box_height
+
+                        box_3d_pts = points_input[int(y1):int(y2), int(x1):int(x2)]  # (120, 40, 3)
+                        if box_3d_pts.size == 0:
+                            continue
+                        pts_flat = box_3d_pts.reshape(-1, 3)  # (N, 3)
+                        valid_mask = ~np.isnan(pts_flat).any(axis=1) & (pts_flat != 0).any(axis=1)  # (N,)
+                        valid_pts = pts_flat[valid_mask]  # (N, 3)
+                        if len(valid_pts) == 0:
+                            continue
+                        median_3d = np.median(valid_pts, axis=0)
+                        pos_dict[id] = median_3d
+                        # print(f"detect id {id} median loc: {median_3d}")
+                    # coopting the data field since it is unused.
+                    detections.data = pos_dict
+                    # pred_color = plot_bbox(frame_rgb, bbox_result, detections.tracker_id, show_plot=False, return_img=True)
+                else:
+                    # pred_color = frame_rgb
+                    detections = sv.Detections(xyxy=np.array([[0, 0, 0, 0]]), confidence=np.array([0.7]),
+                                               tracker_id=np.array([0]), data={})
+                # detection queue
+                self.detection_queue.append(detections)
+                if len(self.detection_queue) > self.detection_queue_len:
+                    self.detection_queue.pop(0)
                 if self.show_time_performance:
-                    self.get_logger().info(f"obj_detect_result took {(time.perf_counter() - t1) * 1000:.1f} ms")
-            if self.show_time_performance:
-                t2 = time.perf_counter()
-                self.get_logger().info(f"=== >  depth + bbox inference took {(t2 - t0) * 1000:.1f} ms")
+                    t3 = time.perf_counter()
+                    self.get_logger().info(f"tracker update took {(t3 - t2) * 1000:.1f} ms")
+                # robot_velocity_camera = self.get_robot_velocity_camera("camera_color_optical_frame")
+                robot_velocity_camera = self.get_linear_velocity()
+                if robot_velocity_camera is None:
+                    robot_velocity_camera=np.array([0, 0, 0.0])
+                self.get_logger().info(f"robot_velocity_camera: {robot_velocity_camera}")
+                # update points according to velocity obstacles...
+                updated_points, point_movement_cam = update_points(points_input, self.detection_queue,
+                                                                   robot_velocity_camera=robot_velocity_camera, last_n_records=3,
+                                                                   time_incr=0.5, time_look_ahead=1.0)
+                point_movement_bev = [
+                    (
+                        transform_point(self.T_base_from_cam, prev_point),
+                        transform_point(self.T_base_from_cam, after_point),
+                    )
+                    for prev_point, after_point in point_movement_cam
+                ]
 
-            if len(bbox_only) > 0:
-                dummy_confidence = np.ones(len(bbox_only)) * 0.7
-                sv_detection = sv.Detections(xyxy=np.array(bbox_only), confidence=dummy_confidence)
-                detections = self.tracker.update_with_detections(sv_detection)
-                pos_dict = {}
-                for box, id in zip(detections.xyxy, detections.tracker_id):
-                    x1, y1, x2, y2 = box
-                    # update box size
-                    box_width = x2 - x1
-                    box_height = y2 - y1
-
-                    x1 += 0.10 * box_width
-                    x2 -= 0.10 * box_width
-                    y1 += 0.10 * box_height
-                    y2 -= 0.10 * box_height
-
-                    box_3d_pts = points_input[int(y1):int(y2), int(x1):int(x2)]  # (120, 40, 3)
-                    if box_3d_pts.size == 0:
-                        continue
-                    pts_flat = box_3d_pts.reshape(-1, 3)  # (N, 3)
-                    valid_mask = ~np.isnan(pts_flat).any(axis=1) & (pts_flat != 0).any(axis=1)  # (N,)
-                    valid_pts = pts_flat[valid_mask]  # (N, 3)
-                    if len(valid_pts) == 0:
-                        continue
-                    median_3d = np.median(valid_pts, axis=0)
-                    pos_dict[id] = median_3d
-                    # print(f"detect id {id} median loc: {median_3d}")
-                # coopting the data field since it is unused.
-                detections.data = pos_dict
-                # pred_color = plot_bbox(frame_rgb, bbox_result, detections.tracker_id, show_plot=False, return_img=True)
-            else:
-                # pred_color = frame_rgb
-                detections = sv.Detections(xyxy=np.array([[0, 0, 0, 0]]), confidence=np.array([0.7]),
-                                           tracker_id=np.array([0]), data={})
-            # detection queue
-            self.detection_queue.append(detections)
-            if len(self.detection_queue) > self.detection_queue_len:
-                self.detection_queue.pop(0)
-            if self.show_time_performance:
-                t3 = time.perf_counter()
-                self.get_logger().info(f"tracker update took {(t3 - t2) * 1000:.1f} ms")
-            # robot_velocity_camera = self.get_robot_velocity_camera("camera_color_optical_frame")
-            robot_velocity_camera = self.get_linear_velocity()
-            if robot_velocity_camera is None:
-                robot_velocity_camera=np.array([0, 0, 0.0])
-            self.get_logger().info(f"robot_velocity_camera: {robot_velocity_camera}")
-            # update points according to velocity obstacles...
-            updated_points, point_movement_cam = update_points(points_input, self.detection_queue,
-                                                               robot_velocity_camera=robot_velocity_camera, last_n_records=3,
-                                                               time_incr=0.5, time_look_ahead=1.0)
-            point_movement_bev = [
-                (
-                    transform_point(self.T_base_from_cam, prev_point),
-                    transform_point(self.T_base_from_cam, after_point),
-                )
-                for prev_point, after_point in point_movement_cam
-            ]
-
-            esdf_result, init_path_xy, opt_path_xy = update_trajectories(
-                args, updated_points, estimated_cam_matrix, vla_path, n_iter=2, time_session=False)
-            if self.show_time_performance:
-                t4 = time.perf_counter()
-                self.get_logger().info(f"update_trajectories took {(t4 - t3) * 1000:.1f} ms")
-
-            self.steered_path_pub.publish(self._to_path_msg(opt_path_xy, stamp=latest_waypoint_timestamp))
-            chosen_waypoint = opt_path_xy[self.waypoint_idx]
-
-            # visualization code
-            if self.visualize:
-                # visualize only esdf, ~ 150ms
-                esdf_surface = visualize_esdf(esdf_result=esdf_result,
-                                              before_path=init_path_xy, after_path=opt_path_xy,
-                                              point_movement_bev=point_movement_bev,
-                                              args=args)
-                # visualize path only, ~200ms
-                # esdf_surface = visualize_path_only(depth=depth, rgb=obs_image,
-                #                                    esdf_result=esdf_result, bbox_result=bbox_result,
-                #                                    cam_matrix=self.cam_matrix,
-                #                                    T_cam_from_base=self.T_cam_from_base,
-                #                                    before_path=init_path_xy, after_path=opt_path_xy,
-                #                                    point_movement_bev=point_movement_bev,
-                #                                    args=args)
-                # visualize full quad chart, ~ 500ms
-                # esdf_surface = visualize_path_debug(depth=depth, rgb=obs_image,
-                #                                     esdf_result=esdf_result, bbox_result=bbox_result,
-                #                                     cam_matrix=self.cam_matrix,
-                #                                     T_cam_from_base=self.T_cam_from_base,
-                #                                     before_path=init_path_xy, after_path=opt_path_xy,
-                #                                     point_movement_bev=point_movement_bev,
-                #                                     args=args)
-
-                out_msg = self.br.cv2_to_imgmsg(np.array(esdf_surface), encoding="rgb8")
-                self.trajectory_visual_pub.publish(out_msg)
+                esdf_result, init_path_xy, opt_path_xy = update_trajectories(
+                    args, updated_points, estimated_cam_matrix, vla_path, n_iter=2, time_session=False)
                 if self.show_time_performance:
-                    t5 = time.perf_counter()
-                    self.get_logger().info(f"visualize + publish path took {(t5 - t4) * 1000:.1f} ms")
+                    t4 = time.perf_counter()
+                    self.get_logger().info(f"update_trajectories took {(t4 - t3) * 1000:.1f} ms")
+
+                self.steered_path_pub.publish(self._to_path_msg(opt_path_xy, stamp=latest_waypoint_timestamp))
+                chosen_waypoint = opt_path_xy[self.waypoint_idx]
+
+                # visualization code
+                if self.visualize:
+                    # visualize only esdf, ~ 150ms
+                    esdf_surface = visualize_esdf(esdf_result=esdf_result,
+                                                  before_path=init_path_xy, after_path=opt_path_xy,
+                                                  point_movement_bev=point_movement_bev,
+                                                  args=args)
+                    # visualize path only, ~200ms
+                    # esdf_surface = visualize_path_only(depth=depth, rgb=obs_image,
+                    #                                    esdf_result=esdf_result, bbox_result=bbox_result,
+                    #                                    cam_matrix=self.cam_matrix,
+                    #                                    T_cam_from_base=self.T_cam_from_base,
+                    #                                    before_path=init_path_xy, after_path=opt_path_xy,
+                    #                                    point_movement_bev=point_movement_bev,
+                    #                                    args=args)
+                    # visualize full quad chart, ~ 500ms
+                    # esdf_surface = visualize_path_debug(depth=depth, rgb=obs_image,
+                    #                                     esdf_result=esdf_result, bbox_result=bbox_result,
+                    #                                     cam_matrix=self.cam_matrix,
+                    #                                     T_cam_from_base=self.T_cam_from_base,
+                    #                                     before_path=init_path_xy, after_path=opt_path_xy,
+                    #                                     point_movement_bev=point_movement_bev,
+                    #                                     args=args)
+
+                    out_msg = self.br.cv2_to_imgmsg(np.array(esdf_surface), encoding="rgb8")
+                    self.trajectory_visual_pub.publish(out_msg)
+                    if self.show_time_performance:
+                        t5 = time.perf_counter()
+                        self.get_logger().info(f"visualize + publish path took {(t5 - t4) * 1000:.1f} ms")
 
         waypoint_msg = Float32MultiArray()
         waypoint_msg.data = chosen_waypoint.flatten().tolist()
@@ -510,7 +526,7 @@ if __name__ == "__main__":
         description="ros inference pipeline according to a depth-map ESDF."
     )
     parser.add_argument("-r", "--robot", type=str, help="Robot Name", default="husky")
-    parser.add_argument("--parallel-inference", type=bool, default=1,
+    parser.add_argument("--parallel-inference", type=bool, default=0,
                         help="Run depth and bounding-box inference concurrently on separate CUDA streams.")
     parser.add_argument("--h-min", type=float, default=0.5, help="Minimum kept height in meters.")
     parser.add_argument("--h-max", type=float, default=1.5, help="Maximum kept height in meters.")

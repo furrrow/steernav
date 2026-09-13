@@ -64,5 +64,5 @@ overlay_topic: "/path_overlay"
 # observation rate for the robot
 frame_rate: 15
 controller_rate: 10
-waypoint_idx : 2
+waypoint_idx : 1
 cam_matrix: "cam_matrix.json"
