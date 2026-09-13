@@ -37,6 +37,21 @@ husky:
   vel_topic: "/a200_0648/cmd_vel"
   overlay_topic: "/husky/path_overlay"
   robot_radius: 1.0
+jackal:
+  max_v: 0.2 # m/s
+  max_w: 0.3 # rad/s
+  image_topic: "/camera/camera/color/image_raw/compressed"
+#  image_topic: "/camera/camera/color/image_raw"
+  waypoint_topic: "/jackal/waypoint"
+  odom_topic: "/j100_0707/platform/odom/filtered"
+  policy_path_topic: "/jackal/policy_path"
+  steered_waypoint_topic: "/jackal/steered_waypoint"
+  goal_topic: "/next_goal"
+  reached_goal_topic: "/jackal/topoplan/reached_goal"
+  sampled_actions_topic: "/jackal/sampled_actions"
+  vel_topic: "/j100_0707/cmd_vel"
+  overlay_topic: "/jackal/path_overlay"
+  robot_radius: 0.25
 # general configs
 img_w: 1280
 img_h: 720

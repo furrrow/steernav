@@ -46,8 +46,8 @@ class SteeringNode(Node):
         self.waypoint_timestamp_queue = []
 
         # CONSTANTS
-        parent_dir = "/home/jim/Projects/steernav"
-        # parent_dir = "/home/gamma-nav/Documents/Projects/git_repos/steernav"
+        # parent_dir = "/home/jim/Projects/steernav"
+        parent_dir = "/home/gamma-nav/Documents/Projects/git_repos/steernav"
         # parent_dir = "/workspace/steernav"
         DEPLOY_CONFIG_PATH = f"{parent_dir}/steernav/config/robot.yaml"
         MODEL_CONFIG_PATH = "config/models.yaml"
@@ -368,8 +368,8 @@ class SteeringNode(Node):
             self.get_logger().info(f"robot_velocity_camera: {robot_velocity_camera}")
             # update points according to velocity obstacles...
             updated_points, point_movement_cam = update_points(points_input, self.detection_queue,
-                                           robot_velocity_camera=robot_velocity_camera,
-                                           time_incr=0.5, time_look_ahead=1.0)
+                                                               robot_velocity_camera=robot_velocity_camera, last_n_records=2,
+                                                               time_incr=0.5, time_look_ahead=1.0)
             point_movement_bev = [
                 (
                     transform_point(self.T_base_from_cam, prev_point),
@@ -379,7 +379,7 @@ class SteeringNode(Node):
             ]
 
             esdf_result, init_path_xy, opt_path_xy = update_trajectories(
-                args, updated_points, estimated_cam_matrix, vla_path, time_session=False)
+                args, updated_points, estimated_cam_matrix, vla_path, n_iter=1, time_session=False)
             if self.show_time_performance:
                 t4 = time.perf_counter()
                 self.get_logger().info(f"update_trajectories took {(t4 - t3) * 1000:.1f} ms")
@@ -454,7 +454,7 @@ if __name__ == "__main__":
     parser.add_argument("--resolution", type=float, default=0.10, help="Grid resolution in meters per cell.")
     parser.add_argument("--sensor-x", type=float, default=0.0, help="Sensor x location in map frame.")
     parser.add_argument("--sensor-y", type=float, default=0.0, help="Sensor y location in map frame.")
-    parser.add_argument("--camera-height", type=float, default=0.15, help="AGL, in meters")
+    parser.add_argument("--camera-height", type=float, default=0.45, help="AGL, in meters")
     parser.add_argument("--img_w", type=int, default=1280, help="resize img width to correctly overlay path")
     parser.add_argument("--img_h", type=int, default=720, help="resize img height to correctly overlay path")
     parser.add_argument("--esdf-height-scale", type=float, default=1.8)
