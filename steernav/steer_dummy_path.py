@@ -290,6 +290,30 @@ def sample_mesh_z_and_gradient(path_xy: np.ndarray, valid_mesh: ValidESDFMesh, e
     grad_dir = np.divide(grad_xy, norms, out=np.zeros_like(grad_xy), where=norms > 1e-6)
     return z_scaled, grad_xy, grad_dir
 
+def get_path_update_scale(
+    path: np.ndarray,
+    min_scale: float = 0.1,
+    max_scale: float = 1.0,
+    power: float = 1.0,
+):
+    """
+    power < 1       far points become flexible quickly
+    power = 1       linear
+    power > 1       first part stays stiff longer
+    """
+    segment_length = np.linalg.norm(np.diff(path, axis=0), axis=1)
+    distance_along_path = np.concatenate([[0.0], np.cumsum(segment_length)])
+
+    if distance_along_path[-1] > 1e-8:
+        alpha = distance_along_path / distance_along_path[-1]
+    else:
+        alpha = np.zeros(len(path))
+
+    # Optional nonlinear ramp
+    alpha = alpha ** power
+    scale = min_scale + (max_scale - min_scale) * alpha
+    return scale[:, None]
+
 def adam_update_numpy(
         path_xy: np.ndarray,
         valid_mesh: ValidESDFMesh,
@@ -302,6 +326,8 @@ def adam_update_numpy(
         eps: float = 1e-8,
         fix_beginning: bool = False,
         fix_end: bool = False,
+        truncation_distance: float = 0.75,
+        truncation_power: float = 2.0,
 ) -> np.ndarray:
     """
     Optimizes path_xy using Adam optimization.
@@ -315,6 +341,33 @@ def adam_update_numpy(
     for t in range(1, iterations + 1):
         # 1. Evaluate analytical gradient at current path positions
         z_scaled, grad_xy, _ = sample_mesh_z_and_gradient(path, valid_mesh, esdf_height_scale)
+        # 1.5,NEW: truncate / scale the ESDF gradient
+        #
+        # Your code below treats:
+        #     z_scaled < 0
+        # as navigable. Therefore I would initially use z_scaled
+        # directly as your "cost-like" quantity rather than assuming
+        # conventional SDF signs.
+        #
+        # Here:
+        #   z_scaled >= 0     -> strongest obstacle influence
+        #   z_scaled << 0     -> progressively weaker influence
+        #
+        # Example, truncation_distance = 0.75:
+        #
+        #   z =  0.00  -> weight = 1.0
+        #   z = -0.25  -> weight ~= 0.44  (power=2)
+        #   z = -0.50  -> weight ~= 0.11
+        #   z = -0.75  -> weight = 0
+        #   z < -0.75  -> weight = 0
+        normalized_cost = np.clip(
+            (z_scaled + truncation_distance) / truncation_distance,
+            0.0,
+            1.0,
+        )
+        obstacle_weight = normalized_cost ** truncation_power
+        grad_xy = grad_xy * obstacle_weight[:, None]
+
         # 2. Compute smooth force gradient (derivative of Laplacian objective)
         smooth_force = np.zeros_like(path)
         smooth_force[1:-1] = path[:-2] - 2.0 * path[1:-1] + path[2:]
@@ -339,7 +392,8 @@ def adam_update_numpy(
         v_hat = v / (1.0 - beta2 ** t)
 
         # 5. Parameter Update
-        path -= lr * m_hat / (np.sqrt(v_hat) + eps)
+        update_scale = get_path_update_scale(path, min_scale=0.05, max_scale=1.0, power=1.5)
+        path -= update_scale * lr * m_hat / (np.sqrt(v_hat) + eps)
 
     path = constrain_xy_to_esdf(path, valid_mesh)
     # filter out waypoints where z-height is negative, indicating navicable points.

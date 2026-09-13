@@ -364,7 +364,7 @@ class SteeringNode(Node):
                     self.get_logger().info(f"obj_detect_result took {(time.perf_counter() - t1) * 1000:.1f} ms")
             if self.show_time_performance:
                 t2 = time.perf_counter()
-                self.get_logger().info(f"depth + bbox inference took {(t2 - t0) * 1000:.1f} ms")
+                self.get_logger().info(f"=== >  depth + bbox inference took {(t2 - t0) * 1000:.1f} ms")
 
             if len(bbox_only) > 0:
                 dummy_confidence = np.ones(len(bbox_only)) * 0.7
@@ -425,7 +425,7 @@ class SteeringNode(Node):
             ]
 
             esdf_result, init_path_xy, opt_path_xy = update_trajectories(
-                args, updated_points, estimated_cam_matrix, vla_path, n_iter=1, time_session=False)
+                args, updated_points, estimated_cam_matrix, vla_path, n_iter=2, time_session=False)
             if self.show_time_performance:
                 t4 = time.perf_counter()
                 self.get_logger().info(f"update_trajectories took {(t4 - t3) * 1000:.1f} ms")
