@@ -74,7 +74,7 @@ class SteeringNode(Node):
         self.path_frame_id = "base_link"
         self._started_sent = False
         self.show_time_performance = True
-        self.visualize = True
+        self.visualize = False
 
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(
@@ -367,6 +367,8 @@ class SteeringNode(Node):
                 wait((depth_future, bbox_future))
                 points_input, estimated_cam_matrix, depth = depth_future.result()
                 bbox_result, bbox_only = bbox_future.result()
+
+                torch.cuda.synchronize(self.device)
             else:
                 points_input, estimated_cam_matrix, depth = self._infer_depth(obs_image)
                 if self.show_time_performance:
@@ -386,12 +388,23 @@ class SteeringNode(Node):
                 pos_dict = {}
                 for box, id in zip(detections.xyxy, detections.tracker_id):
                     x1, y1, x2, y2 = box
+
+                    box_width = x2 - x1
+                    box_height = y2 - y1
+
+                    x1 += 0.10 * box_width
+                    x2 -= 0.10 * box_width
+                    y1 += 0.10 * box_height
+                    y2 -= 0.10 * box_height
+
                     box_3d_pts = points_input[int(y1):int(y2), int(x1):int(x2)]  # (120, 40, 3)
                     if box_3d_pts.size == 0:
                         continue
                     pts_flat = box_3d_pts.reshape(-1, 3)  # (N, 3)
                     valid_mask = ~np.isnan(pts_flat).any(axis=1) & (pts_flat != 0).any(axis=1)  # (N,)
                     valid_pts = pts_flat[valid_mask]  # (N, 3)
+                    if len(valid_pts) == 0:
+                        continue
                     median_3d = np.median(valid_pts, axis=0)
                     pos_dict[id] = median_3d
                     # print(f"detect id {id} median loc: {median_3d}")
@@ -416,7 +429,7 @@ class SteeringNode(Node):
             self.get_logger().info(f"robot_velocity_camera: {robot_velocity_camera}")
             # update points according to velocity obstacles...
             updated_points, point_movement_cam = update_points(points_input, self.detection_queue,
-                                                               robot_velocity_camera=robot_velocity_camera, last_n_records=2,
+                                                               robot_velocity_camera=robot_velocity_camera, last_n_records=3,
                                                                time_incr=0.5, time_look_ahead=1.0)
             point_movement_bev = [
                 (
