@@ -1,4 +1,6 @@
 from __future__ import annotations
+
+from collections import deque
 import matplotlib
 matplotlib.use("Agg")
 
@@ -30,7 +32,7 @@ from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
 import tf2_ros
 from geometry_msgs.msg import Vector3Stamped, PoseStamped
 
-from custom_utils.esdf_utils import visualize_esdf, debug_visualize, visualize_path_only
+from custom_utils.esdf_utils import visualize_esdf, debug_visualize
 from custom_utils.io_utils import load_calibration, filter_unwanted_results
 
 from moge.model.v2 import MoGeModel
@@ -39,15 +41,59 @@ from steer_dummy_path import update_trajectories, transform_point
 from custom_utils.pointcloud_utils import update_points
 
 
+def resample_path_and_pick_waypoint(
+    opt_path_xy,
+    target_distance: float = 0.3,
+    eps: float = 1e-8,
+) -> np.ndarray:
+    """Pick a waypoint at a fixed lookahead distance along a path.
+
+    The path is expressed in the robot base frame, so the robot is treated as
+    the origin. If the path is shorter than target_distance, return the last
+    reachable point.
+    """
+    path_xy = np.asarray(opt_path_xy, dtype=np.float64)
+    if path_xy.size == 0:
+        return np.zeros(2, dtype=np.float64)
+
+    if path_xy.ndim == 1:
+        if path_xy.shape[0] < 2:
+            return np.zeros(2, dtype=np.float64)
+        path_xy = path_xy[:2][None, :]
+    elif path_xy.ndim != 2 or path_xy.shape[1] < 2:
+        raise ValueError("opt_path_xy must have shape (N, 2) or (N, >=2)")
+    else:
+        path_xy = path_xy[:, :2]
+
+    path_xy = path_xy[np.isfinite(path_xy).all(axis=1)]
+    if len(path_xy) == 0:
+        return np.zeros(2, dtype=np.float64)
+
+    points = np.vstack((np.zeros(2, dtype=np.float64), path_xy))
+    segment_vectors = np.diff(points, axis=0)
+    segment_lengths = np.linalg.norm(segment_vectors, axis=1)
+
+    remaining = float(target_distance)
+    if remaining <= eps:
+        return np.zeros(2, dtype=np.float64)
+
+    last_reachable = points[0]
+    for start, vector, length in zip(points[:-1], segment_vectors, segment_lengths):
+        if length <= eps:
+            continue
+        last_reachable = start + vector
+        if remaining <= length:
+            return start + (remaining / length) * vector
+        remaining -= length
+
+    return last_reachable
+
+
 class SteeringNode(Node):
     def __init__(self, args: argparse.Namespace):
         super().__init__('Steering_Node')
 
         self.buffer_size = None
-        self.image_queue = []
-        self.image_timestamp_queue = []
-        self.paths_queue = []
-        self.waypoint_timestamp_queue = []
 
         # CONSTANTS
         parent_dir = FilePath(__file__).resolve().parent.parent
@@ -105,7 +151,8 @@ class SteeringNode(Node):
         self.buffer_size = model_params["buffer_size"]
         self.cam_matrix, self.dist_coeffs, self.T_base_from_cam = load_calibration(CAMERA_MATRIX_DIR)
         self.T_cam_from_base = np.linalg.inv(self.T_base_from_cam)
-
+        self.image_queue = deque(maxlen=self.buffer_size+1)
+        self.paths_queue = deque(maxlen=self.buffer_size+1)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print("Using device:", self.device)
         depth_model_name = model_params['depth_model_name']
@@ -214,11 +261,7 @@ class SteeringNode(Node):
             self.obs_img = self.obs_img.resize(self.shrink_img_size)
 
         if self.buffer_size is not None:
-            if len(self.image_queue) >= self.buffer_size + 1:
-                self.image_queue.pop(0)
-                self.image_timestamp_queue.pop(0)
             self.image_queue.append(self.obs_img)
-            self.image_timestamp_queue.append(self.obs_img_timestamp)
 
     def odom_callback_obs(self, msg: Odometry):
         # self.get_logger().info("Reached Odom callback!")
@@ -263,24 +306,7 @@ class SteeringNode(Node):
             waypoints.append((x, y, hx, hy))
 
         if self.buffer_size is not None:
-            if len(self.paths_queue) >= self.buffer_size + 1:
-                self.paths_queue.pop(0)
-                self.waypoint_timestamp_queue.pop(0)
-
             self.paths_queue.append(np.array(waypoints))
-            self.waypoint_timestamp_queue.append(waypoint_stamp)
-
-    def find_closest_stamp(self, target_stamp):
-        if len(self.image_queue) == 0:
-            self.get_logger().warn("Steering Node: image_queue empty!")
-            return 0
-        timestamps = np.array([t.sec + (t.nanosec * 1e-9) for t in self.image_timestamp_queue])
-        timestamp_diff = timestamps - (target_stamp.sec + target_stamp.nanosec * 1e-9)
-        # self.get_logger().info(f"target_stamp {target_stamp}")
-        # self.get_logger().info(f"self.image_timestamp_queue {self.image_timestamp_queue}")
-        # self.get_logger().info(f"timestamp_diff {timestamp_diff}")
-        closest_idx = np.argmin(np.abs(timestamp_diff))
-        return closest_idx
 
     def _to_path_msg(self, path_xy: np.ndarray, stamp=None) -> Path:
         msg = Path()
@@ -348,18 +374,13 @@ class SteeringNode(Node):
         chosen_waypoint = np.zeros(2)
         if (len(self.image_queue) > self.buffer_size) and (len(self.paths_queue) > 0):
             t0 = time.perf_counter()
-            latest_waypoint_timestamp = self.waypoint_timestamp_queue[-1]
             last_path = self.paths_queue[-1]
-            closest_idx = self.find_closest_stamp(latest_waypoint_timestamp)
-            closest_stamp = self.image_timestamp_queue[closest_idx]
-            sec_diff = closest_stamp.sec - latest_waypoint_timestamp.sec + (closest_stamp.nanosec - latest_waypoint_timestamp.nanosec) * 1e-9
-            # self.get_logger().info(f"closest_idx {closest_idx}, closest_stamp - latest_waypoint_timestamp: {sec_diff:.6f} sec")
             self.get_logger().info(f"last path: {last_path}")
             if last_path[self.waypoint_idx][0] == 0 and last_path[self.waypoint_idx][1] == 0:
                 self.get_logger().info(f"received pure rotation command: {last_path[self.waypoint_idx]}")
                 chosen_waypoint = last_path[self.waypoint_idx]
             else:
-                obs_image = np.array(self.image_queue[closest_idx])
+                obs_image = np.array(self.image_queue[-1])
                 vla_path = np.array(last_path)
 
                 if self.inference_executor is not None:
@@ -430,7 +451,8 @@ class SteeringNode(Node):
                 self.get_logger().info(f"robot_velocity_camera: {robot_velocity_camera}")
                 # update points according to velocity obstacles...
                 updated_points, point_movement_cam = update_points(points_input, self.detection_queue,
-                                                                   robot_velocity_camera=robot_velocity_camera, last_n_records=3,
+                                                                   robot_velocity_camera=robot_velocity_camera,
+                                                                   last_n_records=3,
                                                                    time_incr=0.5, time_look_ahead=1.0)
                 point_movement_bev = [
                     (
@@ -446,8 +468,9 @@ class SteeringNode(Node):
                     t4 = time.perf_counter()
                     self.get_logger().info(f"update_trajectories took {(t4 - t3) * 1000:.1f} ms")
 
-                self.steered_path_pub.publish(self._to_path_msg(opt_path_xy, stamp=latest_waypoint_timestamp))
-                chosen_waypoint = opt_path_xy[self.waypoint_idx]
+                self.steered_path_pub.publish(self._to_path_msg(opt_path_xy))
+                chosen_waypoint = resample_path_and_pick_waypoint(opt_path_xy)
+                self.get_logger().info(f"resample & chosen_waypoint {chosen_waypoint}")
 
                 # visualization code
                 if self.visualize:
