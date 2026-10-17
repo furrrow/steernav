@@ -15,13 +15,14 @@ from torch import Tensor
 from transformers import AutoProcessor, AutoModelForCausalLM
 
 import matplotlib
-matplotlib.use("TkAgg")
+# Respect the backend selected by the importing application. ros_inference
+# selects Agg so it can run on a headless robot.
 from scipy.ndimage import zoom, gaussian_filter
 from scipy.spatial import cKDTree
 from moge.model.v2 import MoGeModel
 import supervision as sv
 
-from custom_utils.esdf_utils import visualize_static_dynamic_paths, debug_visualize, visualize_esdf, \
+from custom_utils.esdf_utils import visualize_static_dynamic_paths, visualize_esdf, \
     visualize_path_debug, visualize_depth_only
 from custom_utils.stream_handler import FrameStatus, InputStreamHandler
 from custom_utils.io_utils import save_depth_video_mp4
@@ -699,13 +700,7 @@ def main() -> int:
                                           before_path=init_path_xy, after_path=static_path_xy,
                                           point_movement_bev=point_movement_bev,
                                           args=args)
-            esdf_surface = visualize_depth_only(depth=depth, rgb=original_frame,
-                                               esdf_result=dynamic_esdf_result, cam_matrix=cam_matrix,
-                                                bbox_result=bbox_result,
-                                               T_cam_from_base=T_cam_from_base,
-                                               before_path=init_path_xy, after_path=dynamic_path_xy,
-                                                point_movement_bev=point_movement_bev,
-                                               args=args)
+            # esdf_surface = visualize_depth_only(depth=depth)
 
             if frame_idx == save_frame_idx:
                 image_path = f"frame_depth_{frame_idx:04d}.png"

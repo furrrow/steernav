@@ -32,7 +32,7 @@ from nav_msgs.msg import Path, Odometry
 from rclpy.qos import QoSDurabilityPolicy, QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
 import tf2_ros
 
-from custom_utils.esdf_utils import visualize_esdf, debug_visualize, visualize_path_debug
+from custom_utils.esdf_utils import visualize_esdf, visualize_path_debug, visualize_camera_esdf
 from custom_utils.io_utils import load_calibration, filter_unwanted_results
 
 from moge.model.v2 import MoGeModel
@@ -41,7 +41,41 @@ from steer_dummy_path import update_trajectories, transform_point
 from custom_utils.pointcloud_utils import update_points
 
 
-def resample_path_and_pick_waypoint(
+def resample_path(path, num_waypoints: int = 8, eps: float = 1e-8) -> np.ndarray:
+    """Resample a path to equally spaced XY waypoints along its arc length."""
+    if not isinstance(num_waypoints, (int, np.integer)) or num_waypoints <= 0:
+        raise ValueError("num_waypoints must be a positive integer")
+
+    path_xy = np.asarray(path, dtype=np.float64)
+    if path_xy.ndim == 1:
+        if path_xy.shape[0] < 2:
+            return np.zeros((num_waypoints, 2), dtype=np.float64)
+        path_xy = path_xy[:2][None, :]
+    elif path_xy.ndim != 2 or path_xy.shape[1] < 2:
+        raise ValueError("path must have shape (N, 2) or (N, >=2)")
+    else:
+        path_xy = path_xy[:, :2]
+
+    path_xy = path_xy[np.isfinite(path_xy).all(axis=1)]
+    if len(path_xy) == 0:
+        return np.zeros((num_waypoints, 2), dtype=np.float64)
+
+    if len(path_xy) > 1:
+        keep = np.r_[True, np.linalg.norm(np.diff(path_xy, axis=0), axis=1) > eps]
+        path_xy = path_xy[keep]
+    if len(path_xy) == 1:
+        return np.repeat(path_xy, num_waypoints, axis=0)
+
+    segment_lengths = np.linalg.norm(np.diff(path_xy, axis=0), axis=1)
+    cumulative_distance = np.r_[0.0, np.cumsum(segment_lengths)]
+    sample_distances = np.linspace(0.0, cumulative_distance[-1], num_waypoints)
+    return np.column_stack([
+        np.interp(sample_distances, cumulative_distance, path_xy[:, axis])
+        for axis in range(2)
+    ])
+
+
+def pick_waypoint(
     opt_path_xy,
     target_distance: float,
     eps: float = 1e-8,
@@ -89,6 +123,29 @@ def resample_path_and_pick_waypoint(
     return last_reachable
 
 
+def transform_robot_twist_to_camera(linear_velocity_base, angular_velocity_base,
+                                    T_base_from_cam):
+    """Return camera-origin linear and angular velocity in camera axes."""
+    linear_velocity_base = np.asarray(linear_velocity_base, dtype=np.float64)
+    angular_velocity_base = np.asarray(angular_velocity_base, dtype=np.float64)
+    T_base_from_cam = np.asarray(T_base_from_cam, dtype=np.float64)
+    if linear_velocity_base.shape != (3,) or angular_velocity_base.shape != (3,):
+        raise ValueError("linear and angular velocity must each have shape (3,)")
+    if T_base_from_cam.shape != (4, 4):
+        raise ValueError("T_base_from_cam must have shape (4, 4)")
+
+    rotation_cam_from_base = T_base_from_cam[:3, :3].T
+    camera_offset_base = T_base_from_cam[:3, 3]
+    camera_linear_velocity_base = (
+        linear_velocity_base
+        + np.cross(angular_velocity_base, camera_offset_base)
+    )
+    return (
+        rotation_cam_from_base @ camera_linear_velocity_base,
+        rotation_cam_from_base @ angular_velocity_base,
+    )
+
+
 class SteeringNode(Node):
     def __init__(self, args: argparse.Namespace):
         super().__init__('Steering_Node')
@@ -102,11 +159,18 @@ class SteeringNode(Node):
         # parent_dir = "/workspace/steernav"
         DEPLOY_CONFIG_PATH = f"{parent_dir}/steernav/config/robot.yaml"
         MODEL_CONFIG_PATH = f"{parent_dir}/steernav/config/models.yaml"
-        CAMERA_MATRIX_DIR = f"{parent_dir}/steernav/cam_matrix.json"
         with open(DEPLOY_CONFIG_PATH, "r") as f:
             deploy_config = yaml.safe_load(f)
         self.rate = deploy_config["frame_rate"]
         robot_config = deploy_config[args.robot]
+        calibration_path = FilePath(
+            robot_config.get(
+                "camera_calibration",
+                deploy_config.get("cam_matrix", "cam_matrix.json"),
+            )
+        )
+        if not calibration_path.is_absolute():
+            calibration_path = parent_dir / "steernav" / calibration_path
         print(f"using robot config for: {args.robot}")
         self.max_v = robot_config["max_v"]
         self.max_w = robot_config["max_w"]
@@ -118,6 +182,7 @@ class SteeringNode(Node):
         self.shrink_img_size = (deploy_config["shrink_w"], deploy_config["shrink_h"])  # (640, 480)
         self.detection_queue = []
         self.detection_queue_len = 20
+        self.detection_timestamp_queue = deque(maxlen=self.detection_queue_len)
         self.robot_velocity_base = np.zeros(3, dtype=np.float64)
         self.robot_angular_velocity_base = np.zeros(3, dtype=np.float64)
         self.dt = 1 / self.rate
@@ -156,9 +221,12 @@ class SteeringNode(Node):
             model_params = yaml.safe_load(f)
 
         self.buffer_size = model_params["buffer_size"]
-        self.cam_matrix, self.dist_coeffs, self.T_base_from_cam = load_calibration(CAMERA_MATRIX_DIR)
+        self.cam_matrix, self.dist_coeffs, self.T_base_from_cam = load_calibration(
+            str(calibration_path)
+        )
         self.T_cam_from_base = np.linalg.inv(self.T_base_from_cam)
         self.image_queue = deque(maxlen=self.buffer_size+1)
+        self.image_timestamp_queue = deque(maxlen=self.buffer_size+1)
         self.paths_queue = deque(maxlen=self.buffer_size+1)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print("Using device:", self.device)
@@ -196,12 +264,12 @@ class SteeringNode(Node):
         msg_type = CompressedImage if self.compressed_img_topic else Image
         self.image_sub = self.create_subscription(
             msg_type, IMAGE_TOPIC, self.img_callback_obs,
-            qos_profile=QoSProfile(reliability=QoSReliabilityPolicy.RELIABLE,
+            qos_profile=QoSProfile(reliability=QoSReliabilityPolicy.BEST_EFFORT,
                                    history=QoSHistoryPolicy.KEEP_LAST,
                                    depth=10))
         self.odom_sub = self.create_subscription(
             Odometry, ODOM_TOPIC, self.odom_callback_obs,
-            qos_profile=QoSProfile(reliability=QoSReliabilityPolicy.RELIABLE,
+            qos_profile=QoSProfile(reliability=QoSReliabilityPolicy.BEST_EFFORT,
                                    history=QoSHistoryPolicy.KEEP_LAST,
                                    depth=10))
         self.policy_path_sub = self.create_subscription(
@@ -267,8 +335,14 @@ class SteeringNode(Node):
             self.obs_img = self.br.compressed_imgmsg_to_cv2(msg)
         else:
             self.obs_img = self.br.imgmsg_to_cv2(msg)
-        # Original camera timestamp
-        self.obs_img_timestamp = msg.header.stamp
+        # Keep the timestamp paired with the image. Inference latency is variable,
+        # so wall-clock processing intervals are not valid observation intervals.
+        image_timestamp = (
+            float(msg.header.stamp.sec)
+            + float(msg.header.stamp.nanosec) * 1e-9
+        )
+        if image_timestamp <= 0.0:
+            image_timestamp = self.get_clock().now().nanoseconds * 1e-9
         self.obs_img = cv2.cvtColor(self.obs_img, cv2.COLOR_BGR2RGB)
         self.obs_img = PILImage.fromarray(self.obs_img)
         if self.obs_img.size != self.shrink_img_size:
@@ -277,6 +351,7 @@ class SteeringNode(Node):
 
         if self.buffer_size is not None:
             self.image_queue.append(self.obs_img)
+            self.image_timestamp_queue.append(image_timestamp)
 
     def odom_callback_obs(self, msg: Odometry):
         # self.get_logger().info("Reached Odom callback!")
@@ -312,8 +387,10 @@ class SteeringNode(Node):
 
         self.episode_id = episode_id
         self.image_queue.clear()
+        self.image_timestamp_queue.clear()
         self.paths_queue.clear()
         self.detection_queue.clear()
+        self.detection_timestamp_queue.clear()
         self.tracker = sv.ByteTrack()
         self.robot_velocity_base.fill(0.0)
         self.robot_angular_velocity_base.fill(0.0)
@@ -325,12 +402,24 @@ class SteeringNode(Node):
         self.steered_waypoint_pub.publish(stop)
         self.get_logger().info(f"Reset steering state for episode {episode_id}")
 
-    def get_linear_velocity(self):
-        return np.array([
-            self.robot_velocity_base[0],
-            self.robot_velocity_base[1],
-            self.robot_velocity_base[2],
-        ])
+    def get_robot_velocity_camera(self):
+        # Odometry twist is at the base origin. Include the camera lever arm so
+        # this is the velocity of the camera origin, then express it in optical
+        # camera axes (x right, y down, z forward).
+        linear_velocity_camera, _ = transform_robot_twist_to_camera(
+            self.robot_velocity_base,
+            self.robot_angular_velocity_base,
+            self.T_base_from_cam,
+        )
+        return linear_velocity_camera
+
+    def get_robot_angular_velocity_camera(self):
+        _, angular_velocity_camera = transform_robot_twist_to_camera(
+            self.robot_velocity_base,
+            self.robot_angular_velocity_base,
+            self.T_base_from_cam,
+        )
+        return angular_velocity_camera
 
     def path_callback_obs(self, msg: Path):
         waypoint_stamp = msg.header.stamp
@@ -414,7 +503,8 @@ class SteeringNode(Node):
             # self.get_logger().info(f"last path: {last_path}")
             if len(last_path) > 0:
                 obs_image = np.array(self.image_queue[-1])
-                vla_path = np.array(last_path)
+                image_timestamp = self.image_timestamp_queue[-1]
+                vla_path = resample_path(last_path, num_waypoints=8)
 
                 if self.inference_executor is not None:
                     depth_future = self.inference_executor.submit(self._infer_depth, obs_image)
@@ -472,21 +562,22 @@ class SteeringNode(Node):
                                                tracker_id=np.array([0]), data={})
                 # detection queue
                 self.detection_queue.append(detections)
+                self.detection_timestamp_queue.append(image_timestamp)
                 if len(self.detection_queue) > self.detection_queue_len:
                     self.detection_queue.pop(0)
                 if self.show_time_performance:
                     t3 = time.perf_counter()
                     self.get_logger().info(f"tracker update took {(t3 - t2) * 1000:.1f} ms")
-                # robot_velocity_camera = self.get_robot_velocity_camera("camera_color_optical_frame")
-                robot_velocity_camera = self.get_linear_velocity()
-                if robot_velocity_camera is None:
-                    robot_velocity_camera=np.array([0, 0, 0.0])
+                robot_velocity_camera = self.get_robot_velocity_camera()
+                robot_angular_velocity_camera = self.get_robot_angular_velocity_camera()
                 self.get_logger().info(f"robot_velocity_camera: {robot_velocity_camera}")
                 # update points according to velocity obstacles...
                 updated_points, point_movement_cam = update_points(points_input, self.detection_queue,
                                                                    robot_velocity_camera=robot_velocity_camera,
+                                                                   robot_angular_velocity_camera=robot_angular_velocity_camera,
+                                                                   detection_timestamps=self.detection_timestamp_queue,
                                                                    last_n_records=3,
-                                                                   time_incr=0.5, time_look_ahead=1.0)
+                                                                   time_look_ahead=1.0)
                 point_movement_bev = [
                     (
                         transform_point(self.T_base_from_cam, prev_point),
@@ -501,11 +592,11 @@ class SteeringNode(Node):
                     t4 = time.perf_counter()
                     self.get_logger().info(f"update_trajectories took {(t4 - t3) * 1000:.1f} ms")
 
-                chosen_waypoint = resample_path_and_pick_waypoint(
+                chosen_waypoint = pick_waypoint(
                     opt_path_xy,
                     target_distance=self.lookahead_distance,
                 )
-                self.get_logger().info(f"resample & chosen_waypoint {chosen_waypoint}")
+                self.get_logger().info(f"chosen_waypoint {chosen_waypoint}")
 
                 # visualization code
                 if self.visualize:
@@ -514,22 +605,21 @@ class SteeringNode(Node):
                     #                               before_path=init_path_xy, after_path=opt_path_xy,
                     #                               point_movement_bev=point_movement_bev,
                     #                               args=args)
-                    # visualize path only, ~200ms
-                    # esdf_surface = visualize_path_only(depth=depth, rgb=obs_image,
-                    #                                    esdf_result=esdf_result, bbox_result=bbox_result,
-                    #                                    cam_matrix=self.cam_matrix,
-                    #                                    T_cam_from_base=self.T_cam_from_base,
-                    #                                    before_path=init_path_xy, after_path=opt_path_xy,
-                    #                                    point_movement_bev=point_movement_bev,
-                    #                                    args=args)
-                    # visualize full quad chart, ~ 500ms
-                    esdf_surface = visualize_path_debug(depth=depth, rgb=obs_image,
+                    esdf_surface = visualize_camera_esdf(rgb=obs_image,
                                                         esdf_result=esdf_result, bbox_result=bbox_result,
                                                         cam_matrix=self.cam_matrix,
                                                         T_cam_from_base=self.T_cam_from_base,
                                                         before_path=init_path_xy, after_path=opt_path_xy,
                                                         point_movement_bev=point_movement_bev,
                                                         args=args)
+                    # visualize full quad chart, ~ 500ms
+                    # esdf_surface = visualize_path_debug(depth=depth, rgb=obs_image,
+                    #                                     esdf_result=esdf_result, bbox_result=bbox_result,
+                    #                                     cam_matrix=self.cam_matrix,
+                    #                                     T_cam_from_base=self.T_cam_from_base,
+                    #                                     before_path=init_path_xy, after_path=opt_path_xy,
+                    #                                     point_movement_bev=point_movement_bev,
+                    #                                     args=args)
                     frame_rgb = np.asarray(esdf_surface, dtype=np.uint8)
                     out_msg = self.br.cv2_to_imgmsg(frame_rgb, encoding="rgb8")
 

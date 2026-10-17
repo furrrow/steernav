@@ -21,7 +21,7 @@ from scipy.spatial import cKDTree
 from moge.model.v2 import MoGeModel
 import supervision as sv
 
-from custom_utils.esdf_utils import visualize_static_dynamic_paths, debug_visualize, visualize_esdf, \
+from custom_utils.esdf_utils import visualize_static_dynamic_paths, visualize_esdf, \
     visualize_path_debug, visualize_depth_only, visualize_occupy_only, visualize_bbox_only
 from custom_utils.stream_handler import FrameStatus, InputStreamHandler
 from custom_utils.io_utils import save_depth_video_mp4
@@ -694,13 +694,7 @@ def main() -> int:
             #                                       point_movement_bev=point_movement_bev,
             #                                       args=args)
 
-            bbox_img = visualize_bbox_only(depth=depth, rgb=frame_rgb,
-                                           esdf_result=dynamic_esdf_result, cam_matrix=cam_matrix,
-                                           bbox_result=bbox_result,
-                                           T_cam_from_base=T_cam_from_base,
-                                           before_path=init_path_xy, after_path=dynamic_path_xy,
-                                           point_movement_bev=point_movement_bev,
-                                           args=args)
+            bbox_img = visualize_bbox_only(rgb=frame_rgb, bbox_result=bbox_result)
             if frame_idx == save_frame_idx:
                 image_path = f"frame_obj_detect_{frame_idx:04d}.png"
                 cv2.imwrite(
@@ -739,13 +733,7 @@ def main() -> int:
             #
             #     print(f"Saved image: {image_path}")
 
-            # depth_img = visualize_depth_only(depth=depth, rgb=original_frame,
-            #                                    esdf_result=dynamic_esdf_result, cam_matrix=cam_matrix,
-            #                                     bbox_result=bbox_result,
-            #                                    T_cam_from_base=T_cam_from_base,
-            #                                    before_path=init_path_xy, after_path=dynamic_path_xy,
-            #                                     point_movement_bev=point_movement_bev,
-            #                                    args=args)
+            # depth_img = visualize_depth_only(depth=depth)
             # 
             # if frame_idx == save_frame_idx:
             #     image_path = f"frame_depth_{frame_idx:04d}.png"
@@ -758,13 +746,11 @@ def main() -> int:
             # 
             #     print(f"Saved image: {image_path}")
 
-            # ouccupy_map = visualize_occupy_only(depth=depth, rgb=original_frame,
-            #                                  esdf_result=dynamic_esdf_result, cam_matrix=cam_matrix,
-            #                                  bbox_result=bbox_result,
-            #                                  T_cam_from_base=T_cam_from_base,
-            #                                  before_path=init_path_xy, after_path=dynamic_path_xy,
-            #                                  point_movement_bev=point_movement_bev,
-            #                                  args=args)
+            # ouccupy_map = visualize_occupy_only(
+            #     esdf_result=dynamic_esdf_result,
+            #     point_movement_bev=point_movement_bev,
+            #     args=args,
+            # )
             #
             # if frame_idx == save_frame_idx:
             #     image_path = f"frame_occupy_{frame_idx:04d}.png"

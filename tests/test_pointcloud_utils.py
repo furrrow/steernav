@@ -1,8 +1,11 @@
 import numpy as np
+from types import SimpleNamespace
 
 from custom_utils.pointcloud_utils import (
     _find_min_bin_hits,
+    compensate_camera_motion,
     raytrace_visibility_from_points,
+    update_points,
 )
 
 
@@ -46,3 +49,55 @@ def test_raytrace_visibility_uses_nearest_angular_hit():
     assert occupied.any()
     assert visible_free.any()
     np.testing.assert_array_equal(known, occupied | visible_free)
+
+
+def test_camera_translation_is_removed_from_relative_velocity():
+    camera_velocity = np.array([0.0, 0.0, 1.2])
+
+    estimated = compensate_camera_motion(
+        observed_relative_velocity=-camera_velocity,
+        object_position_camera=np.array([2.0, 0.0, 5.0]),
+        robot_velocity_camera=camera_velocity,
+        robot_angular_velocity_camera=np.zeros(3),
+    )
+
+    np.testing.assert_allclose(estimated, np.zeros(3), atol=1e-12)
+
+
+def test_camera_rotation_is_removed_from_relative_velocity():
+    omega_camera = np.array([0.0, -0.4, 0.0])
+    position_camera = np.array([2.0, 0.0, 5.0])
+    apparent_velocity = -np.cross(omega_camera, position_camera)
+
+    estimated = compensate_camera_motion(
+        observed_relative_velocity=apparent_velocity,
+        object_position_camera=position_camera,
+        robot_velocity_camera=np.zeros(3),
+        robot_angular_velocity_camera=omega_camera,
+    )
+
+    np.testing.assert_allclose(estimated, np.zeros(3), atol=1e-12)
+
+
+def test_update_points_uses_observation_timestamps():
+    points = np.zeros((2, 2, 3), dtype=np.float64)
+    points[..., 2] = 4.0
+    detections = [
+        SimpleNamespace(tracker_id=np.array([7]), data={7: np.array([0.0, 0.0, 5.0])}),
+        SimpleNamespace(
+            tracker_id=np.array([7]),
+            data={7: np.array([0.0, 0.0, 4.0])},
+            xyxy=np.array([[0, 0, 2, 2]]),
+        ),
+    ]
+
+    updated, _ = update_points(
+        points,
+        detections,
+        last_n_records=2,
+        detection_timestamps=[10.0, 10.5],
+        time_incr=0.01,
+        time_look_ahead=1.0,
+    )
+
+    np.testing.assert_allclose(updated[..., 2], 2.0)

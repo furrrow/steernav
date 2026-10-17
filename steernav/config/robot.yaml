@@ -28,6 +28,7 @@ husky:
   max_v: 0.2 # m/s
   max_w: 0.3 # rad/s
   lookahead_distance: 0.3 # m
+  camera_calibration: "cam_matrix.json"
   image_topic: "/camera/camera/color/image_raw/compressed"
 #  image_topic: "/argus/ar0234_front_left/image_raw"
   waypoint_topic: "/husky/waypoint"
@@ -45,6 +46,7 @@ sim_nova:
   max_v: 1.5 # m/s
   max_w: 1.2 # rad/s
   lookahead_distance: 1.0 # m
+  camera_calibration: "cam_matrix.json"
   image_topic: "/isaacsim/camera/front/image_raw/compressed"
   waypoint_topic: "/sim_nova/waypoint"
   odom_topic: "/isaacsim/odom"

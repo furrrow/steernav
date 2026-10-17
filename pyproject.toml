@@ -17,6 +17,7 @@ dependencies = [
     "supervision",
     "ultralytics>=8.4.138",
     "opencv-python",
+    "pytest",
 ]
 
 [tool.uv.sources]
@@ -36,6 +37,6 @@ explicit = true
 
 [tool.uv.workspace]
 members = ["services/*"]
-#exclude = ["services/venv"]
 
+#exclude = ["services/venv"]
 
