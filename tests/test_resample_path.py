@@ -24,10 +24,13 @@ resample_path_and_pick_waypoint = load_resample_path_and_pick_waypoint()
 
 
 def test_interpolates_when_first_waypoint_is_too_far():
-    waypoint = resample_path_and_pick_waypoint(np.array([[1.0, 0.0]]))
+    waypoint = resample_path_and_pick_waypoint(
+        np.array([[2.0, 0.0]]),
+        target_distance=1.0,
+    )
 
-    np.testing.assert_allclose(waypoint, [0.3, 0.0])
-    assert np.isclose(np.linalg.norm(waypoint), 0.3)
+    np.testing.assert_allclose(waypoint, [1.0, 0.0])
+    assert np.isclose(np.linalg.norm(waypoint), 1.0)
 
 
 def test_accumulates_across_short_inconsistent_segments():
@@ -37,7 +40,7 @@ def test_accumulates_across_short_inconsistent_segments():
         [0.10, 1.0],
     ])
 
-    waypoint = resample_path_and_pick_waypoint(path)
+    waypoint = resample_path_and_pick_waypoint(path, target_distance=0.3)
 
     np.testing.assert_allclose(waypoint, [0.10, 0.20])
 
@@ -48,7 +51,7 @@ def test_returns_last_point_when_path_is_shorter_than_lookahead():
         [0.10, 0.0],
     ])
 
-    waypoint = resample_path_and_pick_waypoint(path)
+    waypoint = resample_path_and_pick_waypoint(path, target_distance=0.3)
 
     np.testing.assert_allclose(waypoint, [0.10, 0.0])
 
@@ -60,7 +63,7 @@ def test_skips_duplicate_points():
         [0.0, 1.0],
     ])
 
-    waypoint = resample_path_and_pick_waypoint(path)
+    waypoint = resample_path_and_pick_waypoint(path, target_distance=0.3)
 
     np.testing.assert_allclose(waypoint, [0.0, 0.3])
 
@@ -71,7 +74,7 @@ def test_accepts_extra_columns_but_returns_xy():
         [1.0, 0.0, 1.0, 0.0],
     ])
 
-    waypoint = resample_path_and_pick_waypoint(path)
+    waypoint = resample_path_and_pick_waypoint(path, target_distance=0.3)
 
     np.testing.assert_allclose(waypoint, [0.3, 0.0])
     assert waypoint.shape == (2,)

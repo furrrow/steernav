@@ -39,13 +39,9 @@ class VisualOverlayNode(Node):
         self.image_stamp = 0
         self.last_rendered_policy_stamp_ns = -1
 
-        # image and path queues that contain:
-        # (timestamp, image)
-        # (timestamp, path_xy)
-        # (timestamp, path_xy)
+        # Image and policy-path queues contain timestamped observations.
         self.image_queue = deque(maxlen=150)
         self.policy_path_queue = deque(maxlen=300)
-        self.steered_path_queue = deque(maxlen=300)
 
         # CONSTANTS
         parent_dir = "/home/jim/Projects/steernav"
@@ -57,7 +53,6 @@ class VisualOverlayNode(Node):
         with open(DEPLOY_CONFIG_PATH, "r") as f:
             deploy_config = yaml.safe_load(f)
         self.rate = deploy_config["frame_rate"]
-        self.waypoint_idx = deploy_config['waypoint_idx']
         robot_config = deploy_config[args.robot]
         print(f"using robot config for: {args.robot}")
         self.max_v = robot_config["max_v"]
@@ -83,13 +78,12 @@ class VisualOverlayNode(Node):
         self.plotting_steered_path = False
 
         # ROS Topics
-        OVERLAY_TOPIC = deploy_config['overlay_topic'] # no robot, just /path_overlay
+        OVERLAY_TOPIC = robot_config['overlay_topic']
         IMAGE_TOPIC = robot_config['image_topic']
         ODOM_TOPIC = robot_config['odom_topic']
         self.compressed_img_topic = True if "compressed" in IMAGE_TOPIC else False
         print(f"IMAGE_TOPIC: {IMAGE_TOPIC} compressed_img_topic: {self.compressed_img_topic}")
         POLICY_PATH_TOPIC = robot_config['policy_path_topic']
-        STEERED_PATH_TOPIC = robot_config['steered_path_topic']
 
         self.compressed = "compressed" in IMAGE_TOPIC.lower()
 
@@ -121,10 +115,6 @@ class VisualOverlayNode(Node):
         self.policy_path_sub = self.create_subscription(
             Path, POLICY_PATH_TOPIC, self.policy_path_callback,
             qos_profile=reliable_qos)
-        self.steered_path_sub = self.create_subscription(
-            Path, STEERED_PATH_TOPIC, self.steered_path_callback,
-            qos_profile=reliable_qos)
-
         self.overlay_pub = self.create_publisher(
             Image, OVERLAY_TOPIC, qos_profile=reliable_qos)
         self.timer = self.create_timer(1.0 / args.rate, self.render_callback)
@@ -162,36 +152,12 @@ class VisualOverlayNode(Node):
         path_xy = [(pose_stamped.pose.position.x, pose_stamped.pose.position.y) for pose_stamped in msg.poses]
         self.policy_path_queue.append((path_timestamp_ns, path_xy))
 
-    def steered_path_callback(self, msg: Path):
-        if not msg.poses:
-            return
-        # self.get_logger().info("Reached steered_path_callback!")
-        path_timestamp_ns = self.stamp_to_ns(msg.header.stamp)
-        path_xy = [(pose_stamped.pose.position.x, pose_stamped.pose.position.y) for pose_stamped in msg.poses]
-        self.steered_path_queue.append((path_timestamp_ns, path_xy))
-
-    def get_matching_image_and_paths(self, max_dt_sec: float = 5.0):
+    def get_matching_image_and_path(self, max_dt_sec: float = 5.0):
         # max_dt_sec: max time difference allowed
         # returns everything as None if no match found
         max_dt_ns = int(max_dt_sec * 1e9)
-        adjusted_path = None
         # policy_path as anchor:
         target_ns, policy_path = self.policy_path_queue[-1]
-
-        # check steered_path_queue
-        min_steer_idx = np.argmin(np.abs([stamp_ns - target_ns for (stamp_ns, path) in self.steered_path_queue]))
-        steered_stamp_ns, steered_path = self.steered_path_queue[min_steer_idx]
-        steered_dt_ns = abs(steered_stamp_ns - target_ns)
-        print(f"steered_dt s:{steered_dt_ns/1e9:.3f} min_steer_idx {min_steer_idx}")
-        # check of closest unadjusted path time is too old/new
-        if steered_dt_ns < max_dt_ns:
-            adjusted_path = steered_path
-            print(f"closest steered path idx:{min_steer_idx}")
-        else:
-            print(f"steered_dt s:{steered_dt_ns/1e9:.3f}")
-            print(f"max_dt s:{max_dt_ns/1e9:.3f}")
-            print(f"no path match, returning all none")
-            return None, None, None, None
         # check image_queue
         min_img_idx = np.argmin(
             np.abs([stamp_ns - target_ns for (stamp_ns, path, fr_id) in self.image_queue]))
@@ -201,9 +167,9 @@ class VisualOverlayNode(Node):
         # check of closest img time is too old/new
         if image_dt_ns > max_dt_ns:
             print(f"no img match, returning all none")
-            return None, None, None, None
+            return None, None, None
 
-        return image, policy_path, adjusted_path, target_ns
+        return image, policy_path, target_ns
 
     def render_callback(self):
         # Copy references/snapshot while holding the lock very briefly.
@@ -212,9 +178,7 @@ class VisualOverlayNode(Node):
                 return
             if len(self.policy_path_queue) == 0:
                 return
-            if len(self.steered_path_queue) == 0:
-                return
-            image, policy_path, adjusted_path, policy_stamp_ns = self.get_matching_image_and_paths()
+            image, policy_path, policy_stamp_ns = self.get_matching_image_and_path()
             # Do not redraw the same camera frame if last drawn frame is within n seconds (to nanosec)
             if image is None:
                 return
@@ -222,12 +186,8 @@ class VisualOverlayNode(Node):
                 return
 
         try:
-            if adjusted_path is not None:
-                path = np.stack((policy_path, adjusted_path), axis=0)
-            else:
-                path = policy_path
             resized = cv2.resize(image, dsize=(1280, 720), interpolation=cv2.INTER_CUBIC)
-            overlay_bgr = overlay_path(trajectories=np.array(path),
+            overlay_bgr = overlay_path(trajectories=np.array(policy_path),
                                        img=resized,
                                        cam_matrix=self.cam_matrix,
                                        T_cam_from_base=self.T_cam_from_base,)

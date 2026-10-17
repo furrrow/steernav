@@ -22,7 +22,7 @@ from moge.model.v2 import MoGeModel
 import supervision as sv
 
 from custom_utils.esdf_utils import visualize_static_dynamic_paths, debug_visualize, visualize_esdf, \
-    visualize_path_debug, visualize_depth_only, visualize_occupy_only
+    visualize_path_debug, visualize_depth_only, visualize_occupy_only, visualize_bbox_only
 from custom_utils.stream_handler import FrameStatus, InputStreamHandler
 from custom_utils.io_utils import save_depth_video_mp4
 from custom_utils.io_utils import load_calibration, filter_unwanted_results
@@ -398,17 +398,17 @@ def adam_update_numpy(
 
     path = constrain_xy_to_esdf(path, valid_mesh)
     # filter out waypoints where z-height is negative, indicating navicable points.
-    z_scaled, grad_xy, _ = sample_mesh_z_and_gradient(path, valid_mesh, esdf_height_scale)
-    z_mask = np.argwhere(z_scaled < 0)
+    # z_scaled, grad_xy, _ = sample_mesh_z_and_gradient(path, valid_mesh, esdf_height_scale)
+    # z_mask = np.argwhere(z_scaled < 0)
     # print(f"original path: {path}")
     # print(f"z_scaled: {z_scaled}")
-    if len(z_mask) == 0:
-        print(f"z_scaled: {z_scaled}")
-        print("all path below esdf criteria, passing zero paths")
-        path = np.zeros_like(path)
-    elif len(z_mask) < len(z_scaled):
-        last_valid_idx = z_mask[-1][0]
-        path[last_valid_idx + 1:] = path[last_valid_idx]
+    # if len(z_mask) == 0:
+    #     print(f"z_scaled: {z_scaled}")
+    #     print("all path below esdf criteria, passing zero paths")
+    #     path = np.zeros_like(path)
+    # elif len(z_mask) < len(z_scaled):
+    #     last_valid_idx = z_mask[-1][0]
+    #     path[last_valid_idx + 1:] = path[last_valid_idx]
         # print(f"constraining path to idx {last_valid_idx} pt: {path[last_valid_idx]}")
     return path
 
@@ -684,46 +684,60 @@ def main() -> int:
             # 5. Render baseline and optimized paths together
 
             t0 = time.perf_counter()
-            # esdf_surface = visualize_static_dynamic_paths(depth=depth, rgb=frame_rgb,
-            #                                               dynamic_esdf_result=dynamic_esdf_result,
-            #                                               static_esdf_result=static_esdf_result,
-            #                                               bbox_result=bbox_result,
-            #                                               cam_matrix=cam_matrix,
-            #                                               T_cam_from_base=T_cam_from_base,
-            #                                               before_path=init_path_xy,
-            #                                               static_path=static_path_xy,
-            #                                               dynamic_path=dynamic_path_xy,
-            #                                               point_movement_bev=point_movement_bev,
-            #                                               args=args)
-            static_esdf = visualize_esdf(esdf_result=static_esdf_result,
-                                          before_path=init_path_xy, after_path=static_path_xy,
-                                          point_movement_bev=point_movement_bev,
-                                          args=args)
-            if frame_idx == save_frame_idx:
-                image_path = f"esdf_frame_static_tmp_{frame_idx:04d}.png"
+            # esdf_surface = visualize_path_debug(depth=depth, rgb=frame_rgb,
+            #                                       esdf_result=dynamic_esdf_result,
+            #                                       bbox_result=bbox_result,
+            #                                       cam_matrix=cam_matrix,
+            #                                       T_cam_from_base=T_cam_from_base,
+            #                                       before_path=init_path_xy,
+            #                                       after_path=dynamic_path_xy,
+            #                                       point_movement_bev=point_movement_bev,
+            #                                       args=args)
 
-                # esdf_surface is RGB, OpenCV expects BGR
+            bbox_img = visualize_bbox_only(depth=depth, rgb=frame_rgb,
+                                           esdf_result=dynamic_esdf_result, cam_matrix=cam_matrix,
+                                           bbox_result=bbox_result,
+                                           T_cam_from_base=T_cam_from_base,
+                                           before_path=init_path_xy, after_path=dynamic_path_xy,
+                                           point_movement_bev=point_movement_bev,
+                                           args=args)
+            if frame_idx == save_frame_idx:
+                image_path = f"frame_obj_detect_{frame_idx:04d}.png"
                 cv2.imwrite(
                     str(image_path),
-                    cv2.cvtColor(static_esdf, cv2.COLOR_RGB2BGR),
+                    cv2.cvtColor(bbox_img, cv2.COLOR_RGB2BGR),
                 )
-
                 print(f"Saved image: {image_path}")
 
-            dynamic_esdf = visualize_esdf(esdf_result=dynamic_esdf_result,
-                                         before_path=init_path_xy, after_path=dynamic_path_xy,
-                                         point_movement_bev=point_movement_bev,
-                                         args=args)
-            if frame_idx == save_frame_idx:
-                image_path = f"esdf_frame_dynamic_tmp_{frame_idx:04d}.png"
+            # static_esdf = visualize_esdf(esdf_result=static_esdf_result,
+            #                               before_path=init_path_xy, after_path=static_path_xy,
+            #                               point_movement_bev=point_movement_bev,
+            #                               args=args)
+            # if frame_idx == save_frame_idx:
+            #     image_path = f"esdf_frame_static_tmp_{frame_idx:04d}.png"
+            #
+            #     # esdf_surface is RGB, OpenCV expects BGR
+            #     cv2.imwrite(
+            #         str(image_path),
+            #         cv2.cvtColor(static_esdf, cv2.COLOR_RGB2BGR),
+            #     )
+            #
+            #     print(f"Saved image: {image_path}")
 
-                # esdf_surface is RGB, OpenCV expects BGR
-                cv2.imwrite(
-                    str(image_path),
-                    cv2.cvtColor(dynamic_esdf, cv2.COLOR_RGB2BGR),
-                )
-
-                print(f"Saved image: {image_path}")
+            # dynamic_esdf = visualize_esdf(esdf_result=dynamic_esdf_result,
+            #                              before_path=init_path_xy, after_path=dynamic_path_xy,
+            #                              point_movement_bev=point_movement_bev,
+            #                              args=args)
+            # if frame_idx == save_frame_idx:
+            #     image_path = f"esdf_frame_dynamic_tmp_{frame_idx:04d}.png"
+            #
+            #     # esdf_surface is RGB, OpenCV expects BGR
+            #     cv2.imwrite(
+            #         str(image_path),
+            #         cv2.cvtColor(dynamic_esdf, cv2.COLOR_RGB2BGR),
+            #     )
+            #
+            #     print(f"Saved image: {image_path}")
 
             # depth_img = visualize_depth_only(depth=depth, rgb=original_frame,
             #                                    esdf_result=dynamic_esdf_result, cam_matrix=cam_matrix,
@@ -732,16 +746,16 @@ def main() -> int:
             #                                    before_path=init_path_xy, after_path=dynamic_path_xy,
             #                                     point_movement_bev=point_movement_bev,
             #                                    args=args)
-            #
+            # 
             # if frame_idx == save_frame_idx:
             #     image_path = f"frame_depth_{frame_idx:04d}.png"
-            #
+            # 
             #     # esdf_surface is RGB, OpenCV expects BGR
             #     cv2.imwrite(
             #         str(image_path),
             #         cv2.cvtColor(depth_img, cv2.COLOR_RGB2BGR),
             #     )
-            #
+            # 
             #     print(f"Saved image: {image_path}")
 
             # ouccupy_map = visualize_occupy_only(depth=depth, rgb=original_frame,
@@ -763,7 +777,7 @@ def main() -> int:
             #
             #     print(f"Saved image: {image_path}")
 
-            esdf_surface = dynamic_esdf
+            esdf_surface = bbox_img
             t1 = time.perf_counter()
             print(f"visualize_path {(t1 - t0) * 1000:.1f} ms")
             cv2.imshow(

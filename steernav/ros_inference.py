@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import deque
+import json
 import matplotlib
 matplotlib.use("Agg")
 
@@ -26,13 +27,12 @@ from queue import Queue, Full, Empty
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Image, CompressedImage
-from std_msgs.msg import Bool, Float32MultiArray, Empty
+from std_msgs.msg import Bool, Float32MultiArray, Empty, String
 from nav_msgs.msg import Path, Odometry
-from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
+from rclpy.qos import QoSDurabilityPolicy, QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
 import tf2_ros
-from geometry_msgs.msg import Vector3Stamped, PoseStamped
 
-from custom_utils.esdf_utils import visualize_esdf, debug_visualize
+from custom_utils.esdf_utils import visualize_esdf, debug_visualize, visualize_path_debug
 from custom_utils.io_utils import load_calibration, filter_unwanted_results
 
 from moge.model.v2 import MoGeModel
@@ -43,7 +43,7 @@ from custom_utils.pointcloud_utils import update_points
 
 def resample_path_and_pick_waypoint(
     opt_path_xy,
-    target_distance: float = 0.3,
+    target_distance: float,
     eps: float = 1e-8,
 ) -> np.ndarray:
     """Pick a waypoint at a fixed lookahead distance along a path.
@@ -106,11 +106,13 @@ class SteeringNode(Node):
         with open(DEPLOY_CONFIG_PATH, "r") as f:
             deploy_config = yaml.safe_load(f)
         self.rate = deploy_config["frame_rate"]
-        self.waypoint_idx = deploy_config['waypoint_idx']
         robot_config = deploy_config[args.robot]
         print(f"using robot config for: {args.robot}")
         self.max_v = robot_config["max_v"]
         self.max_w = robot_config["max_w"]
+        self.lookahead_distance = float(robot_config["lookahead_distance"])
+        if not np.isfinite(self.lookahead_distance) or self.lookahead_distance < 0:
+            raise ValueError("lookahead_distance must be finite and >= 0")
         args.robot_radius=robot_config["robot_radius"]
         self.original_img_size = (deploy_config["img_w"], deploy_config["img_h"])  # (1280, 720)
         self.shrink_img_size = (deploy_config["shrink_w"], deploy_config["shrink_h"])  # (640, 480)
@@ -120,10 +122,16 @@ class SteeringNode(Node):
         self.robot_angular_velocity_base = np.zeros(3, dtype=np.float64)
         self.dt = 1 / self.rate
         self.reached_goal = False
+        self.require_episode = args.robot == "sim_nova"
+        self.episode_id = None
         self.path_frame_id = "base_link"
         self._started_sent = False
         self.show_time_performance = False
         self.visualize = True
+        self.save_video = False
+        self.video_writer = None
+        self.video_path = "esdf_debug.mp4"
+        self.video_fps = 5.0
 
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(
@@ -139,7 +147,6 @@ class SteeringNode(Node):
         self.compressed_img_topic = True if "compressed" in IMAGE_TOPIC else False
         print(f"IMAGE_TOPIC: {IMAGE_TOPIC} compressed_img_topic: {self.compressed_img_topic}")
         POLICY_PATH_TOPIC = robot_config['policy_path_topic']
-        STEERED_PATH_TOPIC = robot_config['steered_path_topic']
         STEERED_WAYPOINT_TOPIC = robot_config['steered_waypoint_topic']
         SAMPLED_ACTIONS_TOPIC = robot_config['sampled_actions_topic']
         OVERLAY_TOPIC = robot_config['overlay_topic']
@@ -202,12 +209,21 @@ class SteeringNode(Node):
             qos_profile=QoSProfile(reliability=QoSReliabilityPolicy.RELIABLE,
                                    history=QoSHistoryPolicy.KEEP_LAST,
                                    depth=10))
+        self.episode_sub = None
+        if self.require_episode:
+            episode_qos = QoSProfile(
+                reliability=QoSReliabilityPolicy.RELIABLE,
+                durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+                history=QoSHistoryPolicy.KEEP_LAST,
+                depth=1,
+            )
+            self.episode_sub = self.create_subscription(
+                String,
+                args.episode_topic,
+                self.episode_callback,
+                qos_profile=episode_qos,
+            )
         # publishers:
-        self.steered_path_pub = self.create_publisher(
-            Path, STEERED_PATH_TOPIC,
-            qos_profile=QoSProfile(reliability=QoSReliabilityPolicy.RELIABLE,
-                                   history=QoSHistoryPolicy.KEEP_LAST,
-                                   depth=10))
         self.steered_waypoint_pub = self.create_publisher(
             Float32MultiArray, STEERED_WAYPOINT_TOPIC,
             qos_profile=QoSProfile(reliability=QoSReliabilityPolicy.RELIABLE,
@@ -224,15 +240,14 @@ class SteeringNode(Node):
                                                          depth=10))
         # self.goal_pub = self.create_publisher(Bool, REACHED_GOAL_TOPIC, 1)
         self.pub_started = self.create_publisher(Empty, "/started", 10)
-        self.pub_path = self.create_publisher(Path, STEERED_PATH_TOPIC,
-                                              qos_profile=QoSProfile(reliability=QoSReliabilityPolicy.RELIABLE,
-                                                                     history=QoSHistoryPolicy.KEEP_LAST,
-                                                                     depth=10))
         self.timer = self.create_timer(1.0 / self.rate, lambda: self.run_steering_loop(args))
 
         # self.imsave_timer = self.create_timer(1, lambda: self.save_images_and_actions())
 
-        print("Waiting for image observations...")
+        if self.require_episode:
+            print(f"Waiting for simulation episodes on {args.episode_topic}...")
+        else:
+            print("Waiting for image observations...")
 
         self.model_params = model_params
 
@@ -277,6 +292,39 @@ class SteeringNode(Node):
             msg.twist.twist.angular.z,
         ]
 
+    def episode_callback(self, msg: String) -> None:
+        """Clear all steering state before accepting data for a new sim episode."""
+        try:
+            episode = json.loads(msg.data)
+            episode_id = episode["episode_id"]
+            if not isinstance(episode_id, str) or not episode_id:
+                raise ValueError("episode_id must be a nonempty string")
+            if episode.get("state") != "started":
+                return
+            if episode.get("robot_type") != "nova_carter":
+                raise ValueError("expected robot_type nova_carter")
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+            self.get_logger().error(f"Invalid episode message: {exc}")
+            return
+
+        if episode_id == self.episode_id:
+            return
+
+        self.episode_id = episode_id
+        self.image_queue.clear()
+        self.paths_queue.clear()
+        self.detection_queue.clear()
+        self.tracker = sv.ByteTrack()
+        self.robot_velocity_base.fill(0.0)
+        self.robot_angular_velocity_base.fill(0.0)
+        self.inference_count = 0
+        self.inference_start_time = time.perf_counter()
+
+        stop = Float32MultiArray()
+        stop.data = [0.0, 0.0]
+        self.steered_waypoint_pub.publish(stop)
+        self.get_logger().info(f"Reset steering state for episode {episode_id}")
+
     def get_linear_velocity(self):
         return np.array([
             self.robot_velocity_base[0],
@@ -308,29 +356,15 @@ class SteeringNode(Node):
         if self.buffer_size is not None:
             self.paths_queue.append(np.array(waypoints))
 
-    def _to_path_msg(self, path_xy: np.ndarray, stamp=None) -> Path:
-        msg = Path()
-        if stamp is None:
-            stamp = self.get_clock().now().to_msg()
-        msg.header.stamp = stamp
-        msg.header.frame_id = self.path_frame_id  # semantic: "start frame"
-
-        for x, y in path_xy:
-            ps = PoseStamped()
-            ps.header = msg.header
-            ps.pose.position.x = float(x)
-            ps.pose.position.y = float(y)
-            ps.pose.position.z = 0.0
-            ps.pose.orientation.w = 1.0
-            msg.poses.append(ps)
-
-        return msg
-
     def destroy_node(self):
         self.timer.cancel()
         if self.inference_executor is not None:
             self.inference_executor.shutdown(wait=True)
             self.inference_executor = None
+        if self.video_writer is not None:
+            self.video_writer.release()
+            self.video_writer = None
+            self.get_logger().info(f"Saved video to {self.video_path}")
         return super().destroy_node()
 
     def _infer_depth(self, obs_image):
@@ -372,14 +406,13 @@ class SteeringNode(Node):
 
     def run_steering_loop(self, args):
         chosen_waypoint = np.zeros(2)
+        if self.require_episode and self.episode_id is None:
+            return
         if (len(self.image_queue) > self.buffer_size) and (len(self.paths_queue) > 0):
             t0 = time.perf_counter()
             last_path = self.paths_queue[-1]
-            self.get_logger().info(f"last path: {last_path}")
-            if last_path[self.waypoint_idx][0] == 0 and last_path[self.waypoint_idx][1] == 0:
-                self.get_logger().info(f"received pure rotation command: {last_path[self.waypoint_idx]}")
-                chosen_waypoint = last_path[self.waypoint_idx]
-            else:
+            # self.get_logger().info(f"last path: {last_path}")
+            if len(last_path) > 0:
                 obs_image = np.array(self.image_queue[-1])
                 vla_path = np.array(last_path)
 
@@ -463,22 +496,24 @@ class SteeringNode(Node):
                 ]
 
                 esdf_result, init_path_xy, opt_path_xy = update_trajectories(
-                    args, updated_points, estimated_cam_matrix, vla_path, n_iter=2, time_session=False)
+                    args, updated_points, estimated_cam_matrix, vla_path, n_iter=20, time_session=False)
                 if self.show_time_performance:
                     t4 = time.perf_counter()
                     self.get_logger().info(f"update_trajectories took {(t4 - t3) * 1000:.1f} ms")
 
-                self.steered_path_pub.publish(self._to_path_msg(opt_path_xy))
-                chosen_waypoint = resample_path_and_pick_waypoint(opt_path_xy)
+                chosen_waypoint = resample_path_and_pick_waypoint(
+                    opt_path_xy,
+                    target_distance=self.lookahead_distance,
+                )
                 self.get_logger().info(f"resample & chosen_waypoint {chosen_waypoint}")
 
                 # visualization code
                 if self.visualize:
                     # visualize only esdf, ~ 150ms
-                    esdf_surface = visualize_esdf(esdf_result=esdf_result,
-                                                  before_path=init_path_xy, after_path=opt_path_xy,
-                                                  point_movement_bev=point_movement_bev,
-                                                  args=args)
+                    # esdf_surface = visualize_esdf(esdf_result=esdf_result,
+                    #                               before_path=init_path_xy, after_path=opt_path_xy,
+                    #                               point_movement_bev=point_movement_bev,
+                    #                               args=args)
                     # visualize path only, ~200ms
                     # esdf_surface = visualize_path_only(depth=depth, rgb=obs_image,
                     #                                    esdf_result=esdf_result, bbox_result=bbox_result,
@@ -488,15 +523,35 @@ class SteeringNode(Node):
                     #                                    point_movement_bev=point_movement_bev,
                     #                                    args=args)
                     # visualize full quad chart, ~ 500ms
-                    # esdf_surface = visualize_path_debug(depth=depth, rgb=obs_image,
-                    #                                     esdf_result=esdf_result, bbox_result=bbox_result,
-                    #                                     cam_matrix=self.cam_matrix,
-                    #                                     T_cam_from_base=self.T_cam_from_base,
-                    #                                     before_path=init_path_xy, after_path=opt_path_xy,
-                    #                                     point_movement_bev=point_movement_bev,
-                    #                                     args=args)
+                    esdf_surface = visualize_path_debug(depth=depth, rgb=obs_image,
+                                                        esdf_result=esdf_result, bbox_result=bbox_result,
+                                                        cam_matrix=self.cam_matrix,
+                                                        T_cam_from_base=self.T_cam_from_base,
+                                                        before_path=init_path_xy, after_path=opt_path_xy,
+                                                        point_movement_bev=point_movement_bev,
+                                                        args=args)
+                    frame_rgb = np.asarray(esdf_surface, dtype=np.uint8)
+                    out_msg = self.br.cv2_to_imgmsg(frame_rgb, encoding="rgb8")
 
-                    out_msg = self.br.cv2_to_imgmsg(np.array(esdf_surface), encoding="rgb8")
+                    # Save visualization to video
+                    if self.save_video:
+                        frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+                        h, w = frame_bgr.shape[:2]
+
+                        # Initialize writer on first frame
+                        if self.video_writer is None:
+                            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                            self.video_writer = cv2.VideoWriter(
+                                self.video_path,
+                                fourcc,
+                                self.video_fps,
+                                (w, h)
+                            )
+
+                            if not self.video_writer.isOpened():
+                                raise RuntimeError(f"Failed to open video: {self.video_path}")
+
+                        self.video_writer.write(frame_bgr)
                     self.trajectory_visual_pub.publish(out_msg)
                     if self.show_time_performance:
                         t5 = time.perf_counter()
@@ -549,6 +604,11 @@ if __name__ == "__main__":
         description="ros inference pipeline according to a depth-map ESDF."
     )
     parser.add_argument("-r", "--robot", type=str, help="Robot Name", default="husky")
+    parser.add_argument(
+        "--episode-topic",
+        default="/isaacsim/episode",
+        help="Episode metadata topic used by sim_nova to reset steering state.",
+    )
     parser.add_argument("--parallel-inference", type=bool, default=0,
                         help="Run depth and bounding-box inference concurrently on separate CUDA streams.")
     parser.add_argument("--h-min", type=float, default=0.5, help="Minimum kept height in meters.")
