@@ -576,7 +576,7 @@ class SteeringNode(Node):
                                                                    robot_velocity_camera=robot_velocity_camera,
                                                                    robot_angular_velocity_camera=robot_angular_velocity_camera,
                                                                    detection_timestamps=self.detection_timestamp_queue,
-                                                                   last_n_records=3,
+                                                                   last_n_records=2,
                                                                    time_look_ahead=1.0)
                 point_movement_bev = [
                     (

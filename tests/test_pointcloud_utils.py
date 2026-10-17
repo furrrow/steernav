@@ -98,6 +98,86 @@ def test_update_points_uses_observation_timestamps():
         detection_timestamps=[10.0, 10.5],
         time_incr=0.01,
         time_look_ahead=1.0,
+        sweep_steps=2,
     )
 
-    np.testing.assert_allclose(updated[..., 2], 2.0)
+    np.testing.assert_allclose(np.unique(updated[..., 2]), [2.0, 4.0])
+
+
+def test_update_points_detects_lateral_motion_and_preserves_swept_path():
+    points = np.zeros((2, 3, 3), dtype=np.float64)
+    points[..., 2] = 4.0
+    detections = [
+        SimpleNamespace(
+            tracker_id=np.array([4]),
+            data={4: np.array([0.0, 0.0, 4.0])},
+            xyxy=np.array([[0, 0, 3, 2]]),
+        ),
+        SimpleNamespace(
+            tracker_id=np.array([4]),
+            data={4: np.array([0.5, 0.0, 4.0])},
+            xyxy=np.array([[0, 0, 3, 2]]),
+        ),
+    ]
+
+    updated, movement = update_points(
+        points,
+        detections,
+        detection_timestamps=[1.0, 2.0],
+        time_look_ahead=1.0,
+        min_dynamic_speed=0.15,
+        sweep_steps=3,
+    )
+
+    np.testing.assert_allclose(np.unique(updated[..., 0]), [0.0, 0.25, 0.5])
+    assert len(movement) == 1
+    np.testing.assert_allclose(movement[0][1] - movement[0][0], [0.5, 0.0, 0.0])
+
+
+def test_update_points_ignores_motion_below_dynamic_speed():
+    points = np.zeros((2, 2, 3), dtype=np.float64)
+    points[..., 2] = 4.0
+    detections = [
+        SimpleNamespace(tracker_id=np.array([3]), data={3: np.array([0.0, 0.0, 4.0])}),
+        SimpleNamespace(
+            tracker_id=np.array([3]),
+            data={3: np.array([0.01, 0.0, 4.0])},
+            xyxy=np.array([[0, 0, 2, 2]]),
+        ),
+    ]
+
+    updated, movement = update_points(
+        points,
+        detections,
+        detection_timestamps=[1.0, 2.0],
+        min_dynamic_speed=0.15,
+    )
+
+    np.testing.assert_array_equal(updated, points)
+    assert movement == []
+
+
+def test_update_points_retains_track_through_one_missed_detection():
+    points = np.zeros((2, 2, 3), dtype=np.float64)
+    points[..., 2] = 4.0
+    detections = [
+        SimpleNamespace(tracker_id=np.array([9]), data={9: np.array([0.0, 0.0, 5.0])}),
+        SimpleNamespace(
+            tracker_id=np.array([9]),
+            data={9: np.array([0.0, 0.0, 4.5])},
+            xyxy=np.array([[0, 0, 2, 2]]),
+        ),
+        SimpleNamespace(tracker_id=np.array([0]), data={}),
+    ]
+
+    updated, movement = update_points(
+        points,
+        detections,
+        detection_timestamps=[1.0, 2.0, 2.5],
+        time_look_ahead=1.0,
+        sweep_steps=2,
+    )
+
+    assert len(movement) == 1
+    np.testing.assert_allclose(movement[0][1][2], 3.25)
+    np.testing.assert_allclose(np.unique(updated[..., 2]), [3.25, 4.0])

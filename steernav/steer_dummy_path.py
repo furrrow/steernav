@@ -23,7 +23,7 @@ from moge.model.v2 import MoGeModel
 import supervision as sv
 
 from custom_utils.esdf_utils import visualize_static_dynamic_paths, visualize_esdf, \
-    visualize_path_debug, visualize_depth_only
+    visualize_path_debug, visualize_depth_only, visualize_camera_esdf
 from custom_utils.stream_handler import FrameStatus, InputStreamHandler
 from custom_utils.io_utils import save_depth_video_mp4
 from custom_utils.io_utils import load_calibration, filter_unwanted_results
@@ -696,10 +696,13 @@ def main() -> int:
             #                                               dynamic_path=dynamic_path_xy,
             #                                               point_movement_bev=point_movement_bev,
             #                                               args=args)
-            esdf_surface = visualize_esdf(esdf_result=static_esdf_result,
-                                          before_path=init_path_xy, after_path=static_path_xy,
-                                          point_movement_bev=point_movement_bev,
-                                          args=args)
+            esdf_surface = visualize_camera_esdf(rgb=frame_rgb,
+                                                 esdf_result=dynamic_esdf_result, bbox_result=bbox_result,
+                                                 cam_matrix=cam_matrix,
+                                                 T_cam_from_base=T_cam_from_base,
+                                                 before_path=init_path_xy, after_path=dynamic_path_xy,
+                                                 point_movement_bev=point_movement_bev,
+                                                 args=args)
             # esdf_surface = visualize_depth_only(depth=depth)
 
             if frame_idx == save_frame_idx:
