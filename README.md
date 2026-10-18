@@ -125,6 +125,7 @@ ByteTrack tracks, compensates tracked motion with timestamp-aligned odometry,
 predicts obstacle motion, and calls `update_trajectories`. The optimized path is
 then reduced to the configured arc-length lookahead waypoint and published.
 
-`--parallel-inference` runs MoGe and Florence-2 concurrently on separate CUDA
-streams, but the timer still waits for both results. `--debug-motion` adds pose,
-twist, timestamp, and track diagnostics. Visualization is currently always on.
+`--no-velocity` skips Florence-2, tracking, and velocity adjustment, passing the
+original depth points directly to `update_trajectories`. `--debug-motion` adds
+pose, twist, timestamp, and track diagnostics. Visualization is currently always
+on.
