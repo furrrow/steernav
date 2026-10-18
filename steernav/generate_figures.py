@@ -315,6 +315,28 @@ def get_path_update_scale(
     scale = min_scale + (max_scale - min_scale) * alpha
     return scale[:, None]
 
+
+def constrain_path_to_feasible_prefix(
+        path: np.ndarray,
+        z_scaled: np.ndarray,
+) -> np.ndarray:
+    """Stop at the first waypoint that does not satisfy the ESDF criterion."""
+    if len(path) != len(z_scaled):
+        raise ValueError("path and z_scaled must contain the same number of points")
+
+    feasible = np.asarray(z_scaled) < 0
+    blocked_indices = np.flatnonzero(~feasible)
+    if len(blocked_indices) == 0:
+        return path
+
+    first_blocked_idx = int(blocked_indices[0])
+    if first_blocked_idx == 0:
+        return np.zeros_like(path)
+
+    path = path.copy()
+    path[first_blocked_idx:] = path[first_blocked_idx - 1]
+    return path
+
 def adam_update_numpy(
         path_xy: np.ndarray,
         valid_mesh: ValidESDFMesh,
@@ -397,19 +419,10 @@ def adam_update_numpy(
         path -= update_scale * lr * m_hat / (np.sqrt(v_hat) + eps)
 
     path = constrain_xy_to_esdf(path, valid_mesh)
-    # filter out waypoints where z-height is negative, indicating navicable points.
-    # z_scaled, grad_xy, _ = sample_mesh_z_and_gradient(path, valid_mesh, esdf_height_scale)
-    # z_mask = np.argwhere(z_scaled < 0)
-    # print(f"original path: {path}")
-    # print(f"z_scaled: {z_scaled}")
-    # if len(z_mask) == 0:
-    #     print(f"z_scaled: {z_scaled}")
-    #     print("all path below esdf criteria, passing zero paths")
-    #     path = np.zeros_like(path)
-    # elif len(z_mask) < len(z_scaled):
-    #     last_valid_idx = z_mask[-1][0]
-    #     path[last_valid_idx + 1:] = path[last_valid_idx]
-        # print(f"constraining path to idx {last_valid_idx} pt: {path[last_valid_idx]}")
+    z_scaled, _, _ = sample_mesh_z_and_gradient(path, valid_mesh, esdf_height_scale)
+    path = constrain_path_to_feasible_prefix(path, z_scaled)
+    if not np.any(z_scaled < 0):
+        print(f"No feasible path: z_scaled={z_scaled}; commanding stop")
     return path
 
 

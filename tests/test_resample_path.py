@@ -69,6 +69,12 @@ def test_skips_duplicate_points():
     np.testing.assert_allclose(waypoint, [0.0, 0.3])
 
 
+def test_all_zero_path_selects_stop_waypoint():
+    waypoint = pick_waypoint(np.zeros((8, 2)), target_distance=0.3)
+
+    np.testing.assert_array_equal(waypoint, [0.0, 0.0])
+
+
 def test_accepts_extra_columns_but_returns_xy():
     path = np.array([
         [0.0, 0.0, 1.0, 0.0],

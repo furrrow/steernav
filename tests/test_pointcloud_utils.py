@@ -141,6 +141,7 @@ def test_update_points_pose_delta_preserves_world_relative_motion():
         detection_timestamps=[10.0, 11.0],
         camera_poses_world=[world_from_early_camera, world_from_late_camera],
         time_look_ahead=1.0,
+        min_dynamic_observations=2,
         sweep_steps=2,
     )
 
@@ -167,6 +168,7 @@ def test_update_points_uses_observation_timestamps():
         detection_timestamps=[10.0, 10.5],
         time_incr=0.01,
         time_look_ahead=1.0,
+        min_dynamic_observations=2,
         sweep_steps=2,
     )
 
@@ -202,8 +204,8 @@ def test_update_points_smooths_velocity_after_initial_detection():
     )
 
     assert len(movement) == 1
-    # Least-squares fit is -0.9 m/s, substantially damping the noisy last pair.
-    np.testing.assert_allclose(movement[0][1] - movement[0][0], [0.0, 0.0, -0.9])
+    # The median pairwise slope recovers -0.5 m/s despite the noisy last pair.
+    np.testing.assert_allclose(movement[0][1] - movement[0][0], [0.0, 0.0, -0.5])
 
 
 def test_update_points_detects_lateral_motion_and_preserves_swept_path():
@@ -228,6 +230,7 @@ def test_update_points_detects_lateral_motion_and_preserves_swept_path():
         detection_timestamps=[1.0, 2.0],
         time_look_ahead=1.0,
         min_dynamic_speed=0.15,
+        min_dynamic_observations=2,
         sweep_steps=3,
     )
 
@@ -253,6 +256,7 @@ def test_update_points_ignores_motion_below_dynamic_speed():
         detections,
         detection_timestamps=[1.0, 2.0],
         min_dynamic_speed=0.15,
+        min_dynamic_observations=2,
     )
 
     np.testing.assert_array_equal(updated, points)
@@ -266,6 +270,11 @@ def test_update_points_retains_track_through_one_missed_detection():
         SimpleNamespace(tracker_id=np.array([9]), data={9: np.array([0.0, 0.0, 5.0])}),
         SimpleNamespace(
             tracker_id=np.array([9]),
+            data={9: np.array([0.0, 0.0, 4.75])},
+            xyxy=np.array([[0, 0, 2, 2]]),
+        ),
+        SimpleNamespace(
+            tracker_id=np.array([9]),
             data={9: np.array([0.0, 0.0, 4.5])},
             xyxy=np.array([[0, 0, 2, 2]]),
         ),
@@ -275,7 +284,7 @@ def test_update_points_retains_track_through_one_missed_detection():
     updated, movement = update_points(
         points,
         detections,
-        detection_timestamps=[1.0, 2.0, 2.5],
+        detection_timestamps=[1.0, 1.5, 2.0, 2.5],
         time_look_ahead=1.0,
         sweep_steps=2,
     )
@@ -283,3 +292,50 @@ def test_update_points_retains_track_through_one_missed_detection():
     assert len(movement) == 1
     np.testing.assert_allclose(movement[0][1][2], 3.25)
     np.testing.assert_allclose(np.unique(updated[..., 2]), [3.25, 4.0])
+
+
+def test_update_points_does_not_project_provisional_two_observation_track():
+    points = np.zeros((2, 2, 3), dtype=np.float64)
+    points[..., 2] = 4.0
+    detections = [
+        SimpleNamespace(tracker_id=np.array([5]), data={5: np.array([0.0, 0.0, 5.0])}),
+        SimpleNamespace(
+            tracker_id=np.array([5]),
+            data={5: np.array([0.0, 0.0, 4.0])},
+            xyxy=np.array([[0, 0, 2, 2]]),
+        ),
+    ]
+
+    updated, movement = update_points(
+        points,
+        detections,
+        detection_timestamps=[1.0, 1.2],
+        time_look_ahead=1.0,
+    )
+
+    np.testing.assert_array_equal(updated, points)
+    assert movement == []
+
+
+def test_update_points_rejects_implausibly_fast_tracking_jump():
+    points = np.zeros((2, 2, 3), dtype=np.float64)
+    points[..., 2] = 4.0
+    detections = [
+        SimpleNamespace(tracker_id=np.array([6]), data={6: np.array([0.0, 0.0, 5.0])}),
+        SimpleNamespace(tracker_id=np.array([6]), data={6: np.array([0.0, 0.0, 4.9])}),
+        SimpleNamespace(
+            tracker_id=np.array([6]),
+            data={6: np.array([0.0, 0.0, 2.0])},
+            xyxy=np.array([[0, 0, 2, 2]]),
+        ),
+    ]
+
+    updated, movement = update_points(
+        points,
+        detections,
+        detection_timestamps=[1.0, 1.1, 1.2],
+        max_dynamic_speed=3.0,
+    )
+
+    np.testing.assert_array_equal(updated, points)
+    assert movement == []

@@ -316,6 +316,35 @@ def get_path_update_scale(
     scale = min_scale + (max_scale - min_scale) * alpha
     return scale[:, None]
 
+
+def constrain_path_to_feasible_prefix(
+        path: np.ndarray,
+        z_scaled: np.ndarray,
+        blocked_threshold: float = 0.03,
+) -> np.ndarray:
+    """Stop at the first waypoint that does not satisfy the ESDF criterion.
+
+    A fully blocked path is represented by zero waypoints, which downstream
+    waypoint selection and control interpret as a stop command. Small positive
+    values up to ``blocked_threshold`` are accepted to prevent ESDF noise near
+    zero from toggling the controller between driving and stopping.
+    """
+    if len(path) != len(z_scaled):
+        raise ValueError("path and z_scaled must contain the same number of points")
+
+    feasible = np.asarray(z_scaled) <= blocked_threshold
+    blocked_indices = np.flatnonzero(~feasible)
+    if len(blocked_indices) == 0:
+        return path
+
+    first_blocked_idx = int(blocked_indices[0])
+    if first_blocked_idx == 0:
+        return np.zeros_like(path)
+
+    path = path.copy()
+    path[first_blocked_idx:] = path[first_blocked_idx - 1]
+    return path
+
 def adam_update_numpy(
         path_xy: np.ndarray,
         valid_mesh: ValidESDFMesh,
@@ -330,6 +359,8 @@ def adam_update_numpy(
         fix_end: bool = False,
         truncation_distance: float = 0.75,
         truncation_power: float = 2.0,
+        blocked_threshold: float = 0.03,
+        debug_motion: bool = False,
 ) -> np.ndarray:
     """
     Optimizes path_xy using Adam optimization.
@@ -398,19 +429,28 @@ def adam_update_numpy(
         path -= update_scale * lr * m_hat / (np.sqrt(v_hat) + eps)
 
     path = constrain_xy_to_esdf(path, valid_mesh)
-    # filter out waypoints where z-height is negative, indicating navicable points.
-    z_scaled, grad_xy, _ = sample_mesh_z_and_gradient(path, valid_mesh, esdf_height_scale)
-    z_mask = np.argwhere(z_scaled < 0)
-    # print(f"original path: {path}")
-    # print(f"z_scaled: {z_scaled}")
-    if len(z_mask) == 0:
-        print(f"z_scaled: {z_scaled}")
-        print("all path below esdf criteria, passing zero paths")
-        path = np.zeros_like(path)
-    elif len(z_mask) < len(z_scaled):
-        last_valid_idx = z_mask[-1][0]
-        path[last_valid_idx + 1:] = path[last_valid_idx]
-        # print(f"constraining path to idx {last_valid_idx} pt: {path[last_valid_idx]}")
+    # Only the contiguous feasible prefix is safe to follow; feasibility later
+    # in a blocked path is irrelevant. Allow a small positive tolerance because
+    # the projected ESDF near zero varies slightly from frame to frame.
+    z_scaled, _, _ = sample_mesh_z_and_gradient(path, valid_mesh, esdf_height_scale)
+    if debug_motion:
+        blocked_indices = np.flatnonzero(z_scaled > blocked_threshold)
+        print(
+            "[motion-debug] path feasibility "
+            f"path_xy={path.tolist()} "
+            f"z_scaled={z_scaled.tolist()} "
+            f"blocked_threshold={blocked_threshold} "
+            f"blocked_indices={blocked_indices.tolist()} "
+            f"first_blocked_idx="
+            f"{None if len(blocked_indices) == 0 else int(blocked_indices[0])}"
+        )
+    path = constrain_path_to_feasible_prefix(
+        path,
+        z_scaled,
+        blocked_threshold=blocked_threshold,
+    )
+    if not np.any(z_scaled <= blocked_threshold):
+        print(f"No feasible path: z_scaled={z_scaled}; commanding stop")
     return path
 
 
@@ -449,8 +489,8 @@ def update_trajectories(args: Namespace,
     opt_path_xy = adam_update_numpy(path_xy=init_path_xy, valid_mesh=valid_mesh,
                                     esdf_height_scale=args.esdf_height_scale,
                                     lr=lr, smooth_weight=smooth_weight,
-                                    iterations=n_iter, )
-    opt_path_xy = constrain_xy_to_esdf(opt_path_xy, valid_mesh)
+                                    iterations=n_iter,
+                                    debug_motion=bool(getattr(args, "debug_motion", False)))
     if time_session:
         t3 = time.perf_counter()
         print(f"constrain path, adam_update_numpy {(t3 - t2) * 1000:.1f} ms")

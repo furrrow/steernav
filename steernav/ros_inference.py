@@ -296,6 +296,10 @@ class SteeringNode(Node):
         self.latest_odom_timestamp = None
         self.motion_track_debug_history = {}
         self.motion_track_debug_active_ids = set()
+        # Estimate track motion from the central half of each detection. Large
+        # grounding boxes often include background whose median depth can jump
+        # between surfaces even when the box itself is stable.
+        self.velocity_box_inset_fraction = 0.25
         self.robot_velocity_base = np.zeros(3, dtype=np.float64)
         self.robot_angular_velocity_base = np.zeros(3, dtype=np.float64)
         self.dt = 1 / self.rate
@@ -729,14 +733,14 @@ class SteeringNode(Node):
                     pos_dict = {}
                     for box, id in zip(detections.xyxy, detections.tracker_id):
                         x1, y1, x2, y2 = box
-                        # update box size
                         box_width = x2 - x1
                         box_height = y2 - y1
 
-                        x1 += 0.10 * box_width
-                        x2 -= 0.10 * box_width
-                        y1 += 0.10 * box_height
-                        y2 -= 0.10 * box_height
+                        inset = self.velocity_box_inset_fraction
+                        x1 += inset * box_width
+                        x2 -= inset * box_width
+                        y1 += inset * box_height
+                        y2 -= inset * box_height
 
                         box_3d_pts = points_input[int(y1):int(y2), int(x1):int(x2)]  # (120, 40, 3)
                         if box_3d_pts.size == 0:
@@ -837,8 +841,8 @@ class SteeringNode(Node):
                         f"image_stamp={image_timestamp:.6f} "
                         f"latest_odom_stamp={self.latest_odom_timestamp} "
                         f"image_minus_latest_odom={odom_age:.3f} "
-                        f"processing_lag="
-                        f"{self.get_clock().now().nanoseconds * 1e-9 - image_timestamp:.3f} "
+                        f"processing_lag_wall="
+                        f"{time.monotonic() - image_receipt_steady:.3f} "
                         f"pose_aligned={camera_pose_world is not None}"
                     )
                     if len(self.detection_timestamp_queue) >= 2:
@@ -945,6 +949,8 @@ class SteeringNode(Node):
                                                                    camera_poses_world=self.detection_camera_pose_queue,
                                                                    last_n_records=2,
                                                                    velocity_window=5,
+                                                                   min_dynamic_observations=3,
+                                                                   max_dynamic_speed=3.0,
                                                                    time_look_ahead=1.0,
                                                                    debug_motion=self.debug_motion)
                 point_movement_bev = [
