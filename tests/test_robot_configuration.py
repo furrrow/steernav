@@ -10,22 +10,30 @@ ROS_INFERENCE_PATH = ROOT / "steernav" / "ros_inference.py"
 ROBOT_CONFIG_PATH = ROOT / "steernav" / "config" / "robot.yaml"
 
 
-def load_transform_robot_twist_to_camera():
+def load_ros_inference_functions(*names):
     tree = ast.parse(ROS_INFERENCE_PATH.read_text())
-    function_node = next(
+    function_nodes = [
         node
         for node in tree.body
         if isinstance(node, ast.FunctionDef)
-        and node.name == "transform_robot_twist_to_camera"
-    )
-    module = ast.Module(body=[function_node], type_ignores=[])
+        and node.name in names
+    ]
+    module = ast.Module(body=function_nodes, type_ignores=[])
     ast.fix_missing_locations(module)
     namespace = {"np": np}
     exec(compile(module, str(ROS_INFERENCE_PATH), "exec"), namespace)
-    return namespace["transform_robot_twist_to_camera"]
+    return tuple(namespace[name] for name in names)
 
 
-transform_robot_twist_to_camera = load_transform_robot_twist_to_camera()
+(
+    transform_robot_twist_to_camera,
+    interpolate_vector_samples,
+    yaw_from_rotation,
+) = load_ros_inference_functions(
+    "transform_robot_twist_to_camera",
+    "interpolate_vector_samples",
+    "yaw_from_rotation",
+)
 
 
 def test_husky_has_complete_runtime_configuration():
@@ -76,3 +84,26 @@ def test_camera_lever_arm_is_included_for_nonvertical_offset():
     )
 
     np.testing.assert_allclose(linear_camera, [0.0, 0.5, 0.0])
+
+
+def test_vector_samples_are_interpolated_at_image_timestamp():
+    samples = [
+        (10.0, np.array([0.2, 0.0, 0.0])),
+        (11.0, np.array([0.6, 0.0, 0.0])),
+    ]
+
+    interpolated = interpolate_vector_samples(samples, 10.25)
+
+    np.testing.assert_allclose(interpolated, [0.3, 0.0, 0.0])
+    assert interpolate_vector_samples(samples, 9.8) is None
+
+
+def test_yaw_from_rotation_reports_planar_heading_change():
+    angle = 0.4
+    rotation = np.array([
+        [np.cos(angle), -np.sin(angle), 0.0],
+        [np.sin(angle), np.cos(angle), 0.0],
+        [0.0, 0.0, 1.0],
+    ])
+
+    np.testing.assert_allclose(yaw_from_rotation(rotation), angle)

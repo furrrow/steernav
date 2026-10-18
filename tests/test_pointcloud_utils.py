@@ -5,6 +5,7 @@ from custom_utils.pointcloud_utils import (
     _find_min_bin_hits,
     compensate_camera_motion,
     raytrace_visibility_from_points,
+    transform_point_between_camera_poses,
     update_points,
 )
 
@@ -79,6 +80,74 @@ def test_camera_rotation_is_removed_from_relative_velocity():
     np.testing.assert_allclose(estimated, np.zeros(3), atol=1e-12)
 
 
+def test_pose_delta_maps_stationary_point_into_later_camera_frame():
+    world_from_early_camera = np.eye(4)
+    world_from_late_camera = np.eye(4)
+    world_from_late_camera[2, 3] = 1.0
+
+    aligned = transform_point_between_camera_poses(
+        np.array([0.0, 0.0, 5.0]),
+        world_from_early_camera,
+        world_from_late_camera,
+    )
+
+    np.testing.assert_allclose(aligned, [0.0, 0.0, 4.0])
+
+
+def test_update_points_pose_delta_removes_camera_motion():
+    points = np.zeros((2, 2, 3), dtype=np.float64)
+    points[..., 2] = 4.0
+    detections = [
+        SimpleNamespace(tracker_id=np.array([7]), data={7: np.array([0.0, 0.0, 5.0])}),
+        SimpleNamespace(
+            tracker_id=np.array([7]),
+            data={7: np.array([0.0, 0.0, 4.0])},
+            xyxy=np.array([[0, 0, 2, 2]]),
+        ),
+    ]
+    world_from_early_camera = np.eye(4)
+    world_from_late_camera = np.eye(4)
+    world_from_late_camera[2, 3] = 1.0
+
+    updated, movement = update_points(
+        points,
+        detections,
+        detection_timestamps=[10.0, 11.0],
+        camera_poses_world=[world_from_early_camera, world_from_late_camera],
+    )
+
+    np.testing.assert_array_equal(updated, points)
+    assert movement == []
+
+
+def test_update_points_pose_delta_preserves_world_relative_motion():
+    points = np.zeros((2, 2, 3), dtype=np.float64)
+    points[..., 2] = 3.5
+    detections = [
+        SimpleNamespace(tracker_id=np.array([8]), data={8: np.array([0.0, 0.0, 5.0])}),
+        SimpleNamespace(
+            tracker_id=np.array([8]),
+            data={8: np.array([0.0, 0.0, 3.5])},
+            xyxy=np.array([[0, 0, 2, 2]]),
+        ),
+    ]
+    world_from_early_camera = np.eye(4)
+    world_from_late_camera = np.eye(4)
+    world_from_late_camera[2, 3] = 1.0
+
+    _, movement = update_points(
+        points,
+        detections,
+        detection_timestamps=[10.0, 11.0],
+        camera_poses_world=[world_from_early_camera, world_from_late_camera],
+        time_look_ahead=1.0,
+        sweep_steps=2,
+    )
+
+    assert len(movement) == 1
+    np.testing.assert_allclose(movement[0][1] - movement[0][0], [0.0, 0.0, -0.5])
+
+
 def test_update_points_uses_observation_timestamps():
     points = np.zeros((2, 2, 3), dtype=np.float64)
     points[..., 2] = 4.0
@@ -102,6 +171,39 @@ def test_update_points_uses_observation_timestamps():
     )
 
     np.testing.assert_allclose(np.unique(updated[..., 2]), [2.0, 4.0])
+
+
+def test_update_points_smooths_velocity_after_initial_detection():
+    points = np.zeros((2, 2, 3), dtype=np.float64)
+    points[..., 2] = 4.0
+    timestamps = [0.0, 0.1, 0.2, 0.3, 0.4]
+    # Constant -0.5 m/s depth motion with a noisy final observation. A two-point
+    # estimate would report -2.5 m/s for the final interval.
+    depths = [5.0, 4.95, 4.90, 4.85, 4.60]
+    detections = [
+        SimpleNamespace(
+            tracker_id=np.array([12]),
+            data={12: np.array([0.0, 0.0, depth])},
+            xyxy=np.array([[0, 0, 2, 2]]),
+        )
+        for depth in depths
+    ]
+    identity_poses = [np.eye(4) for _ in timestamps]
+
+    _, movement = update_points(
+        points,
+        detections,
+        detection_timestamps=timestamps,
+        camera_poses_world=identity_poses,
+        last_n_records=2,
+        velocity_window=5,
+        time_look_ahead=1.0,
+        sweep_steps=2,
+    )
+
+    assert len(movement) == 1
+    # Least-squares fit is -0.9 m/s, substantially damping the noisy last pair.
+    np.testing.assert_allclose(movement[0][1] - movement[0][0], [0.0, 0.0, -0.9])
 
 
 def test_update_points_detects_lateral_motion_and_preserves_swept_path():

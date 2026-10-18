@@ -702,6 +702,7 @@ def main() -> int:
                                                  T_cam_from_base=T_cam_from_base,
                                                  before_path=init_path_xy, after_path=dynamic_path_xy,
                                                  point_movement_bev=point_movement_bev,
+                                                 tracker_ids=detections.tracker_id,
                                                  args=args)
             # esdf_surface = visualize_depth_only(depth=depth)
 

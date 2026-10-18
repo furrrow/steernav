@@ -57,7 +57,7 @@ sim_nova:
   sampled_actions_topic: "/sim_nova/sampled_actions"
   vel_topic: "/isaacsim/cmd_vel"
   overlay_topic: "/sim_nova/path_overlay"
-  robot_radius: 0.5
+  robot_radius: 0.75
 # general configs
 img_w: 1280
 img_h: 720
