@@ -91,7 +91,8 @@ cd /home/jim/Projects/steernav
 source /opt/ros/humble/setup.bash
 export ROS_DOMAIN_ID=42
 ./steernav/controller.sh \
-  --robot sim_nova --steer --simulation-episode-control --dt 1.5
+  --robot sim_nova --steer --simulation-episode-control --dt 1.5 \
+  --waypoint-timeout 5.0
 ```
 
 Set `ROS_DOMAIN_ID` to the value used by DynaNav's `.env.testing`; `42` above is
@@ -115,6 +116,14 @@ ros2 topic hz /isaacsim/cmd_vel
 A forward nominal path should contain mostly positive `x` values. Verify that a
 new episode causes zero velocity, followed by motion only after a new policy path
 and steered waypoint arrive.
+
+The waypoint timeout must be longer than the slowest complete SteerNav inference
+cycle. The controller defaults to five seconds because the depth, grounding,
+optimization, and visualization stages can collectively exceed the old one-second
+timeout. If the controller repeatedly prints `Not receiving waypoint data`, measure
+the rate of `/sim_nova/steered_waypoint` and set `--waypoint-timeout` above the
+largest normal interval. A zero waypoint received from SteerNav still stops the
+robot immediately.
 
 ## Current processing flow
 

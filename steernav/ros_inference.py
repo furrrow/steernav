@@ -309,6 +309,7 @@ class SteeringNode(Node):
         self.show_time_performance = False
         self.debug_motion = args.debug_motion
         self.no_velocity = args.no_velocity
+        self.time_look_ahead = args.time_look_ahead
         self.visualize = True
         self.save_video = False
         self.video_writer = None
@@ -933,7 +934,7 @@ class SteeringNode(Node):
                         velocity_window=5,
                         min_dynamic_observations=3,
                         max_dynamic_speed=3.0,
-                        time_look_ahead=1.0,
+                        time_look_ahead=self.time_look_ahead,
                         debug_motion=self.debug_motion,
                     )
                     point_movement_bev = [
@@ -1062,6 +1063,13 @@ if __name__ == "__main__":
             "Disable object detection and velocity compensation, and pass the "
             "original depth points directly to trajectory optimization."
         ),
+    )
+    parser.add_argument(
+        "--time-look-ahead",
+        "--time_look_ahead",
+        type=float,
+        default=1.0,
+        help="Obstacle-motion prediction lookahead in seconds.",
     )
     parser.add_argument("--h-min", type=float, default=0.5, help="Minimum kept height in meters.")
     parser.add_argument("--h-max", type=float, default=1.5, help="Maximum kept height in meters.")
