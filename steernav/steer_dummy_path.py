@@ -462,7 +462,9 @@ def update_trajectories(args: Namespace,
                         n_iter: int = 5,
                         lr: float = 0.1,
                         free_space_scaling_factor: float=0.25,
-                        smooth_weight: float = 0.2,) -> tuple[
+                        smooth_weight: float = 0.2,
+                        fix_end: bool = False,
+                        ) -> tuple[
     dict[str, Tensor], ndarray, ndarray]:
     t0 = time.perf_counter()
     rotation, translation = camera_to_base_transform(camera_height=args.camera_height)
@@ -490,6 +492,7 @@ def update_trajectories(args: Namespace,
                                     esdf_height_scale=args.esdf_height_scale,
                                     lr=lr, smooth_weight=smooth_weight,
                                     iterations=n_iter,
+                                    fix_end=fix_end,
                                     debug_motion=bool(getattr(args, "debug_motion", False)))
     if time_session:
         t3 = time.perf_counter()

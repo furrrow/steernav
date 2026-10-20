@@ -947,7 +947,7 @@ class SteeringNode(Node):
 
                 esdf_result, init_path_xy, opt_path_xy = update_trajectories(
                     args, trajectory_points, estimated_cam_matrix, vla_path,
-                    n_iter=20, time_session=False)
+                    n_iter=20, time_session=False, fix_end=args.fix_end)
                 if self.show_time_performance:
                     t4 = time.perf_counter()
                     self.get_logger().info(f"update_trajectories took {(t4 - t3) * 1000:.1f} ms")
@@ -1063,6 +1063,11 @@ if __name__ == "__main__":
             "Disable object detection and velocity compensation, and pass the "
             "original depth points directly to trajectory optimization."
         ),
+    )
+    parser.add_argument(
+        "--fix-end",
+        action="store_true",
+        help="Keep the final path waypoint fixed during trajectory optimization.",
     )
     parser.add_argument(
         "--time-look-ahead",
