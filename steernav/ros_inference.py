@@ -307,7 +307,10 @@ class SteeringNode(Node):
         self.path_frame_id = "base_link"
         self._started_sent = False
         self.show_time_performance = False
-        self.debug_motion = args.debug_motion
+        self.debug_waypoints = args.debug_motion
+        # The CLI debug option is reserved for waypoint diagnostics. Keep the
+        # older odometry and object-motion diagnostics disabled.
+        self.debug_object_motion = False
         self.no_velocity = args.no_velocity
         self.time_look_ahead = args.time_look_ahead
         self.visualize = True
@@ -530,7 +533,7 @@ class SteeringNode(Node):
         self.odom_frame_id = msg.header.frame_id
         self.odom_child_frame_id = msg.child_frame_id
         self.latest_odom_timestamp = timestamp
-        if self.debug_motion and frames_changed:
+        if self.debug_object_motion and frames_changed:
             self.get_logger().info(
                 "[motion-debug] odom frames "
                 f"pose_frame={self.odom_frame_id!r} "
@@ -541,7 +544,7 @@ class SteeringNode(Node):
         try:
             return interpolate_pose_samples(self.odom_pose_buffer, timestamp)
         except ValueError as exc:
-            if self.debug_motion:
+            if self.debug_object_motion:
                 self.get_logger().warn(f"[motion-debug] invalid odometry pose: {exc}")
             return None
 
@@ -731,7 +734,7 @@ class SteeringNode(Node):
                         pos_dict[id] = median_3d
                     # coopting the data field since it is unused.
                     detections.data = pos_dict
-                    if self.debug_motion:
+                    if self.debug_object_motion:
                         current_track_ids = set()
                         for box, track_id in zip(detections.xyxy, detections.tracker_id):
                             track_id = int(track_id)
@@ -783,7 +786,7 @@ class SteeringNode(Node):
                     # pred_color = frame_rgb
                     detections = sv.Detections(xyxy=np.array([[0, 0, 0, 0]]), confidence=np.array([0.7]),
                                                tracker_id=np.array([0]), data={})
-                    if self.debug_motion and self.motion_track_debug_active_ids:
+                    if self.debug_object_motion and self.motion_track_debug_active_ids:
                         self.get_logger().info(
                             f"[track-debug] stamp={image_timestamp:.6f} "
                             f"missing_tracks={sorted(self.motion_track_debug_active_ids)}"
@@ -808,7 +811,7 @@ class SteeringNode(Node):
                     self.get_logger().info(f"tracker update took {(t3 - t2) * 1000:.1f} ms")
                 robot_velocity_camera = self.get_robot_velocity_camera()
                 robot_angular_velocity_camera = self.get_robot_angular_velocity_camera()
-                if self.debug_motion:
+                if self.debug_object_motion:
                     odom_age = (
                         float("nan") if self.latest_odom_timestamp is None
                         else image_timestamp - self.latest_odom_timestamp
@@ -935,7 +938,7 @@ class SteeringNode(Node):
                         min_dynamic_observations=3,
                         max_dynamic_speed=3.0,
                         time_look_ahead=self.time_look_ahead,
-                        debug_motion=self.debug_motion,
+                        debug_motion=self.debug_object_motion,
                     )
                     point_movement_bev = [
                         (
@@ -956,9 +959,9 @@ class SteeringNode(Node):
                     opt_path_xy,
                     target_distance=self.lookahead_distance,
                 )
-                if self.debug_motion:
+                if self.debug_waypoints:
                     self.get_logger().info(
-                        "[motion-debug] selected waypoint "
+                        "[waypoint-debug] selected waypoint "
                         f"waypoint={chosen_waypoint.flatten().tolist()} "
                         f"target_distance={self.lookahead_distance:.3f}"
                     )
@@ -1054,7 +1057,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--debug-motion",
         action="store_true",
-        help="Log odometry and per-track ego-motion compensation details.",
+        help="Log optimized paths, waypoint spacing, folds, and waypoint selection.",
     )
     parser.add_argument(
         "--no-velocity",

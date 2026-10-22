@@ -317,6 +317,90 @@ def get_path_update_scale(
     return scale[:, None]
 
 
+def constrain_path_segment_lengths(
+        path: np.ndarray,
+        max_segment_length: float,
+        preserve_end: bool = False,
+        eps: float = 1e-8,
+) -> np.ndarray:
+    """Project a path so no consecutive waypoints exceed a distance limit.
+
+    The sweep starts from the first waypoint by default. When ``preserve_end``
+    is true, it runs backward so the final waypoint remains unchanged.
+    """
+    if not np.isfinite(max_segment_length) or max_segment_length < 0:
+        raise ValueError("max_segment_length must be finite and nonnegative")
+
+    constrained = np.asarray(path, dtype=np.float64).copy()
+    if len(constrained) < 2:
+        return constrained
+
+    indices = (
+        range(len(constrained) - 2, -1, -1)
+        if preserve_end
+        else range(1, len(constrained))
+    )
+    for index in indices:
+        anchor_index = index + 1 if preserve_end else index - 1
+        displacement = constrained[index] - constrained[anchor_index]
+        distance = np.linalg.norm(displacement)
+        if distance > max_segment_length + eps:
+            constrained[index] = (
+                constrained[anchor_index]
+                + displacement * (max_segment_length / distance)
+            )
+    return constrained
+
+
+def negative_turn_gradient(
+        path: np.ndarray,
+        eps: float = 1e-8,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return the gradient of 0.5 * sum(min(turn_cosine, 0) ** 2)."""
+    path = np.asarray(path, dtype=np.float64)
+    gradient = np.zeros_like(path)
+    if len(path) < 3:
+        return gradient, np.empty(0, dtype=np.float64)
+
+    incoming = path[1:-1] - path[:-2]
+    outgoing = path[2:] - path[1:-1]
+    incoming_lengths = np.linalg.norm(incoming, axis=1)
+    outgoing_lengths = np.linalg.norm(outgoing, axis=1)
+    denominators = incoming_lengths * outgoing_lengths
+    turn_cosines = np.divide(
+        np.sum(incoming * outgoing, axis=1),
+        denominators,
+        out=np.zeros(len(incoming), dtype=np.float64),
+        where=denominators > eps,
+    )
+
+    for turn_index in np.flatnonzero(
+            (turn_cosines < 0.0) & (denominators > eps)):
+        incoming_vector = incoming[turn_index]
+        outgoing_vector = outgoing[turn_index]
+        incoming_length = incoming_lengths[turn_index]
+        outgoing_length = outgoing_lengths[turn_index]
+        cosine = turn_cosines[turn_index]
+
+        cosine_grad_incoming = (
+            outgoing_vector / (incoming_length * outgoing_length)
+            - cosine * incoming_vector / incoming_length ** 2
+        )
+        cosine_grad_outgoing = (
+            incoming_vector / (incoming_length * outgoing_length)
+            - cosine * outgoing_vector / outgoing_length ** 2
+        )
+        loss_grad_incoming = cosine * cosine_grad_incoming
+        loss_grad_outgoing = cosine * cosine_grad_outgoing
+
+        center_index = turn_index + 1
+        gradient[center_index - 1] -= loss_grad_incoming
+        gradient[center_index] += loss_grad_incoming - loss_grad_outgoing
+        gradient[center_index + 1] += loss_grad_outgoing
+
+    return gradient, turn_cosines
+
+
 def constrain_path_to_feasible_prefix(
         path: np.ndarray,
         z_scaled: np.ndarray,
@@ -351,6 +435,7 @@ def adam_update_numpy(
         esdf_height_scale: float,
         lr: float = 0.1,
         smooth_weight: float = 0.2,
+        turn_weight: float = 0.5,
         iterations: int = 5,
         beta1: float = 0.9,
         beta2: float = 0.999,
@@ -361,12 +446,15 @@ def adam_update_numpy(
         truncation_power: float = 2.0,
         blocked_threshold: float = 0.03,
         debug_motion: bool = False,
+        max_segment_length: float | None = None,
 ) -> np.ndarray:
     """
     Optimizes path_xy using Adam optimization.
     Drastically accelerates convergence compared to standard gradient descent.
     """
     path = path_xy.copy()
+    if max_segment_length is None and len(path) > 1:
+        max_segment_length = float(np.max(np.linalg.norm(np.diff(path, axis=0), axis=1)))
 
     # Initialize Adam moment vectors (same shape as path)
     m = np.zeros_like(path)
@@ -374,25 +462,6 @@ def adam_update_numpy(
     for t in range(1, iterations + 1):
         # 1. Evaluate analytical gradient at current path positions
         z_scaled, grad_xy, _ = sample_mesh_z_and_gradient(path, valid_mesh, esdf_height_scale)
-        # 1.5,NEW: truncate / scale the ESDF gradient
-        #
-        # Your code below treats:
-        #     z_scaled < 0
-        # as navigable. Therefore I would initially use z_scaled
-        # directly as your "cost-like" quantity rather than assuming
-        # conventional SDF signs.
-        #
-        # Here:
-        #   z_scaled >= 0     -> strongest obstacle influence
-        #   z_scaled << 0     -> progressively weaker influence
-        #
-        # Example, truncation_distance = 0.75:
-        #
-        #   z =  0.00  -> weight = 1.0
-        #   z = -0.25  -> weight ~= 0.44  (power=2)
-        #   z = -0.50  -> weight ~= 0.11
-        #   z = -0.75  -> weight = 0
-        #   z < -0.75  -> weight = 0
         normalized_cost = np.clip(
             (z_scaled + truncation_distance) / truncation_distance,
             0.0,
@@ -407,9 +476,18 @@ def adam_update_numpy(
 
         # fixing the smooth force of the last element to be zero
         smooth_force[-1] = 0
+        # Penalize only turns that point backward relative to the preceding
+        # segment. This discourages path fold-over without flattening valid
+        # positive-angle turns.
+        turn_gradient, _ = negative_turn_gradient(path, eps=eps)
+
         # 3. Total Loss Gradient: grad_xy pushes AWAY from cost (+), smooth_force pulls towards neighbors (-)
         # We want to minimize cost, so total gradient = grad_xy - smooth_weight * smooth_force
-        grad_total = grad_xy - smooth_weight * smooth_force
+        grad_total = (
+            grad_xy
+            - smooth_weight * smooth_force
+            + turn_weight * turn_gradient
+        )
 
         if fix_beginning:
             grad_total[0:1] = 0.0
@@ -427,17 +505,39 @@ def adam_update_numpy(
         # 5. Parameter Update
         update_scale = get_path_update_scale(path, min_scale=0.05, max_scale=1.0, power=1.5)
         path -= update_scale * lr * m_hat / (np.sqrt(v_hat) + eps)
+        path = constrain_xy_to_esdf(path, valid_mesh)
+        if max_segment_length is not None:
+            path = constrain_path_segment_lengths(
+                path,
+                max_segment_length=max_segment_length,
+                preserve_end=fix_end,
+            )
 
-    path = constrain_xy_to_esdf(path, valid_mesh)
     # Only the contiguous feasible prefix is safe to follow; feasibility later
     # in a blocked path is irrelevant. Allow a small positive tolerance because
     # the projected ESDF near zero varies slightly from frame to frame.
     z_scaled, _, _ = sample_mesh_z_and_gradient(path, valid_mesh, esdf_height_scale)
     if debug_motion:
         blocked_indices = np.flatnonzero(z_scaled > blocked_threshold)
+        segment_vectors = np.diff(path, axis=0)
+        segment_lengths = np.linalg.norm(segment_vectors, axis=1)
+        turn_denominators = segment_lengths[:-1] * segment_lengths[1:]
+        turn_cosines = np.divide(
+            np.sum(segment_vectors[:-1] * segment_vectors[1:], axis=1),
+            turn_denominators,
+            out=np.full_like(turn_denominators, np.nan),
+            where=turn_denominators > eps,
+        )
+        reversal_indices = (np.flatnonzero(turn_cosines < 0.0) + 1).tolist()
         print(
-            "[motion-debug] path feasibility "
-            f"path_xy={path.tolist()} "
+            "[waypoint-debug] optimized path "
+            f"input_path_xy={np.asarray(path_xy).tolist()} "
+            f"optimized_path_xy={path.tolist()} "
+            f"segment_lengths={segment_lengths.tolist()} "
+            f"max_segment_length={max_segment_length} "
+            f"turn_weight={turn_weight} "
+            f"turn_cosines={turn_cosines.tolist()} "
+            f"reversal_waypoint_indices={reversal_indices} "
             f"z_scaled={z_scaled.tolist()} "
             f"blocked_threshold={blocked_threshold} "
             f"blocked_indices={blocked_indices.tolist()} "
@@ -486,6 +586,10 @@ def update_trajectories(args: Namespace,
         t2 = time.perf_counter()
         print(f"build + valid_mesh {(t2 - t1) * 1000:.1f} ms")
     init_path_xy = constrain_xy_to_esdf(input_trajectory[:, :2], valid_mesh)  # (N, 2)
+    input_segment_lengths = np.linalg.norm(np.diff(input_trajectory[:, :2], axis=0), axis=1)
+    max_segment_length = (
+        float(np.max(input_segment_lengths)) if len(input_segment_lengths) > 0 else None
+    )
     # Optimize path using ESDF gradients
     # numpy version, n_iter=5, 1.3ms
     opt_path_xy = adam_update_numpy(path_xy=init_path_xy, valid_mesh=valid_mesh,
@@ -493,6 +597,7 @@ def update_trajectories(args: Namespace,
                                     lr=lr, smooth_weight=smooth_weight,
                                     iterations=n_iter,
                                     fix_end=fix_end,
+                                    max_segment_length=max_segment_length,
                                     debug_motion=bool(getattr(args, "debug_motion", False)))
     if time_session:
         t3 = time.perf_counter()
