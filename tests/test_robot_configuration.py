@@ -29,10 +29,12 @@ def load_ros_inference_functions(*names):
     transform_robot_twist_to_camera,
     interpolate_vector_samples,
     yaw_from_rotation,
+    individual_detection_mask,
 ) = load_ros_inference_functions(
     "transform_robot_twist_to_camera",
     "interpolate_vector_samples",
     "yaw_from_rotation",
+    "individual_detection_mask",
 )
 
 
@@ -107,3 +109,28 @@ def test_yaw_from_rotation_reports_planar_heading_change():
     ])
 
     np.testing.assert_allclose(yaw_from_rotation(rotation), angle)
+
+
+def test_individual_detection_mask_removes_group_box():
+    boxes = np.array([
+        [190.0, 0.2, 608.0, 330.0],
+        [304.0, 0.2, 385.0, 330.0],
+        [526.0, 0.2, 605.0, 320.0],
+    ])
+
+    np.testing.assert_array_equal(
+        individual_detection_mask(boxes, (480, 640, 3)),
+        [False, True, True],
+    )
+
+
+def test_individual_detection_mask_rejects_box_clipped_on_two_edges():
+    boxes = np.array([
+        [228.0, 0.2, 424.0, 479.3],
+        [466.0, 0.2, 526.0, 295.0],
+    ])
+
+    np.testing.assert_array_equal(
+        individual_detection_mask(boxes, (480, 640, 3)),
+        [False, True],
+    )

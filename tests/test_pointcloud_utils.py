@@ -4,10 +4,41 @@ from types import SimpleNamespace
 from custom_utils.pointcloud_utils import (
     _find_min_bin_hits,
     compensate_camera_motion,
+    pointcloud_to_esdf_pipeline,
     raytrace_visibility_from_points,
     transform_point_between_camera_poses,
     update_points,
 )
+
+
+def test_esdf_pipeline_preserves_dynamic_projection_provenance():
+    points = np.array(
+        [
+            [[1.0, 0.0, 0.75], [2.0, 0.0, 0.75]],
+            [[1.0, 0.5, 0.75], [2.0, 0.5, 0.75]],
+        ],
+        dtype=np.float32,
+    )
+    dynamic_projection_mask = np.array(
+        [[False, True], [False, False]], dtype=bool
+    )
+
+    result = pointcloud_to_esdf_pipeline(
+        points,
+        h_min=0.5,
+        h_max=1.0,
+        x_min=0.0,
+        x_max=3.0,
+        y_min=-1.0,
+        y_max=1.0,
+        resolution=0.25,
+        robot_radius=0.25,
+        dynamic_projection_mask=dynamic_projection_mask,
+    )
+
+    dynamic_occupied = result["dynamic_occupied_mask"]
+    assert dynamic_occupied.sum() == 1
+    assert np.all(result["occupied_mask"][dynamic_occupied])
 
 
 def test_find_min_bin_hits_keeps_nearest_point_per_bin():
@@ -206,6 +237,89 @@ def test_update_points_smooths_velocity_after_initial_detection():
     assert len(movement) == 1
     # The median pairwise slope recovers -0.5 m/s despite the noisy last pair.
     np.testing.assert_allclose(movement[0][1] - movement[0][0], [0.0, 0.0, -0.5])
+
+
+def test_update_points_does_not_override_smoothed_direction_for_one_noisy_frame():
+    points = np.zeros((2, 2, 3), dtype=np.float64)
+    points[..., 2] = 4.0
+    timestamps = [0.0, 1.0, 2.0, 3.0]
+    depths = [6.0, 5.0, 4.0, 4.6]
+    detections = [
+        SimpleNamespace(
+            tracker_id=np.array([13]),
+            data={13: np.array([0.0, 0.0, depth])},
+            xyxy=np.array([[0, 0, 2, 2]]),
+        )
+        for depth in depths
+    ]
+
+    _, movement = update_points(
+        points,
+        detections,
+        detection_timestamps=timestamps,
+        camera_poses_world=[np.eye(4) for _ in timestamps],
+        velocity_window=5,
+        time_look_ahead=1.0,
+        sweep_steps=2,
+    )
+
+    assert len(movement) == 1
+    # The robust history still indicates approach; the final noisy sample must
+    # not replace it with the latest two-point +0.6 m/s estimate.
+    assert movement[0][1][2] - movement[0][0][2] < 0.0
+
+
+def test_update_points_ignores_too_short_velocity_baseline():
+    points = np.zeros((2, 2, 3), dtype=np.float64)
+    points[..., 2] = 4.0
+    detections = [
+        SimpleNamespace(
+            tracker_id=np.array([15]),
+            data={15: np.array([0.0, 0.0, depth])},
+            xyxy=np.array([[0, 0, 2, 2]]),
+        )
+        for depth in [5.0, 4.9, 4.95]
+    ]
+
+    _, movement = update_points(
+        points,
+        detections,
+        detection_timestamps=[0.0, 0.1, 0.116666667],
+        camera_poses_world=[np.eye(4) for _ in detections],
+        min_dynamic_observations=2,
+        velocity_window=3,
+        min_velocity_interval=0.075,
+        time_look_ahead=1.0,
+        sweep_steps=2,
+    )
+
+    assert len(movement) == 1
+    # The 16.7 ms final pair alone says +3 m/s. Longer baselines retain the
+    # underlying modest approaching motion.
+    assert movement[0][1][2] - movement[0][0][2] < 0.0
+
+
+def test_update_points_drops_history_across_long_tracking_gap():
+    points = np.zeros((2, 2, 3), dtype=np.float64)
+    points[..., 2] = 4.0
+    present = lambda depth: SimpleNamespace(
+        tracker_id=np.array([14]),
+        data={14: np.array([0.0, 0.0, depth])},
+        xyxy=np.array([[0, 0, 2, 2]]),
+    )
+    missing = SimpleNamespace(tracker_id=np.array([0]), data={})
+    detections = [present(6.0), present(5.0), missing, missing, present(4.0)]
+
+    updated, movement = update_points(
+        points,
+        detections,
+        detection_timestamps=[0.0, 1.0, 2.0, 3.0, 4.0],
+        camera_poses_world=[np.eye(4) for _ in detections],
+        min_dynamic_observations=2,
+    )
+
+    np.testing.assert_array_equal(updated, points)
+    assert movement == []
 
 
 def test_update_points_detects_lateral_motion_and_preserves_swept_path():

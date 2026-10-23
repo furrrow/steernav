@@ -443,6 +443,7 @@ def update_trajectories(args: Namespace,
                                               R=rotation, t=translation,
                                               x_min=args.x_min, x_max=args.x_max,
                                               y_min=args.y_min, y_max=args.y_max,
+                                              resolution=args.resolution,
                                               robot_radius=args.robot_radius,
                                               )
     if time_session:

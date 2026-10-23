@@ -244,6 +244,86 @@ def yaw_from_rotation(rotation):
     return float(np.arctan2(rotation[1, 0], rotation[0, 0]))
 
 
+def rotate_path_deformation_between_base_frames(
+    deformation_xy,
+    previous_world_from_base,
+    current_world_from_base,
+):
+    """Express previous-frame XY displacement vectors in the current base frame."""
+    deformation_xy = np.asarray(deformation_xy, dtype=np.float64)
+    previous_world_from_base = np.asarray(previous_world_from_base, dtype=np.float64)
+    current_world_from_base = np.asarray(current_world_from_base, dtype=np.float64)
+    if deformation_xy.ndim != 2 or deformation_xy.shape[1] != 2:
+        raise ValueError("deformation_xy must have shape (N, 2)")
+    if previous_world_from_base.shape != (4, 4) or current_world_from_base.shape != (4, 4):
+        raise ValueError("base poses must have shape (4, 4)")
+
+    current_from_previous_rotation = (
+        current_world_from_base[:3, :3].T
+        @ previous_world_from_base[:3, :3]
+    )
+    deformation_xyz = np.column_stack(
+        (deformation_xy, np.zeros(len(deformation_xy), dtype=np.float64))
+    )
+    return (deformation_xyz @ current_from_previous_rotation.T)[:, :2]
+
+def individual_detection_mask(
+    boxes,
+    image_shape,
+    containment_threshold=0.8,
+    area_ratio_threshold=2.5,
+    edge_margin=5.0,
+):
+    """Keep individual, measurable boxes and reject group/clipped detections."""
+    boxes = np.asarray(boxes, dtype=np.float64)
+    if boxes.size == 0:
+        return np.zeros(0, dtype=bool)
+    boxes = boxes.reshape(-1, 4)
+    image_height, image_width = image_shape[:2]
+    widths = np.maximum(0.0, boxes[:, 2] - boxes[:, 0])
+    heights = np.maximum(0.0, boxes[:, 3] - boxes[:, 1])
+    areas = widths * heights
+    keep = areas > 0.0
+
+    # Florence can return one crowd-sized box in addition to the individual
+    # people. IoU is small for that pair because the union is the group box, so
+    # detect it by how much of the smaller box the larger one contains.
+    for large_idx in range(len(boxes)):
+        if not keep[large_idx]:
+            continue
+        for small_idx in range(len(boxes)):
+            if large_idx == small_idx or areas[small_idx] <= 0.0:
+                continue
+            if areas[large_idx] < area_ratio_threshold * areas[small_idx]:
+                continue
+            intersection_width = max(
+                0.0,
+                min(boxes[large_idx, 2], boxes[small_idx, 2])
+                - max(boxes[large_idx, 0], boxes[small_idx, 0]),
+            )
+            intersection_height = max(
+                0.0,
+                min(boxes[large_idx, 3], boxes[small_idx, 3])
+                - max(boxes[large_idx, 1], boxes[small_idx, 1]),
+            )
+            if (
+                intersection_width * intersection_height / areas[small_idx]
+                >= containment_threshold
+            ):
+                keep[large_idx] = False
+                break
+
+    # Touching one edge is common for a nearby person. Touching two or more
+    # edges means the sampled body region changes too much for useful velocity.
+    edge_hits = np.column_stack((
+        boxes[:, 0] <= edge_margin,
+        boxes[:, 1] <= edge_margin,
+        boxes[:, 2] >= image_width - edge_margin,
+        boxes[:, 3] >= image_height - edge_margin,
+    )).sum(axis=1)
+    keep &= edge_hits < 2
+    return keep
+
 class SteeringNode(Node):
     def __init__(self, args: argparse.Namespace):
         super().__init__('Steering_Node')
@@ -292,6 +372,9 @@ class SteeringNode(Node):
         self.odom_frame_id = ""
         self.odom_child_frame_id = ""
         self.latest_odom_timestamp = None
+        self.previous_path_deformation = None
+        self.previous_path_pose_world = None
+        self.previous_path_timestamp = None
         self.motion_track_debug_history = {}
         self.motion_track_debug_active_ids = set()
         # Estimate track motion from the central half of each detection. Large
@@ -308,9 +391,9 @@ class SteeringNode(Node):
         self._started_sent = False
         self.show_time_performance = False
         self.debug_waypoints = args.debug_motion
-        # The CLI debug option is reserved for waypoint diagnostics. Keep the
-        # older odometry and object-motion diagnostics disabled.
-        self.debug_object_motion = False
+        self.debug_object_motion = bool(
+            getattr(args, "debug_object_motion", False)
+        )
         self.no_velocity = args.no_velocity
         self.time_look_ahead = args.time_look_ahead
         self.visualize = True
@@ -585,6 +668,9 @@ class SteeringNode(Node):
         self.odom_frame_id = ""
         self.odom_child_frame_id = ""
         self.latest_odom_timestamp = None
+        self.previous_path_deformation = None
+        self.previous_path_pose_world = None
+        self.previous_path_timestamp = None
         self.motion_track_debug_history.clear()
         self.motion_track_debug_active_ids.clear()
         self.tracker = sv.ByteTrack()
@@ -688,6 +774,7 @@ class SteeringNode(Node):
                 image_timestamp = self.image_timestamp_queue[-1]
                 image_receipt_ros = self.image_receipt_ros_queue[-1]
                 image_receipt_steady = self.image_receipt_steady_queue[-1]
+                current_base_pose_world = self.get_base_pose_world(image_timestamp)
                 vla_path = resample_path(last_path, num_waypoints=8)
 
                 if self.no_velocity:
@@ -707,9 +794,18 @@ class SteeringNode(Node):
                     self.get_logger().info(f"=== >  depth + bbox inference took {(t2 - t0) * 1000:.1f} ms")
 
                 if len(bbox_only) > 0:
-                    dummy_confidence = np.ones(len(bbox_only)) * 0.7
-                    sv_detection = sv.Detections(xyxy=np.array(bbox_only), confidence=dummy_confidence)
+                    candidate_boxes = np.asarray(bbox_only, dtype=np.float64).reshape(-1, 4)
+                    keep_mask = individual_detection_mask(
+                        candidate_boxes, obs_image.shape
+                    )
+                    candidate_boxes = candidate_boxes[keep_mask]
+                    dummy_confidence = np.ones(len(candidate_boxes)) * 0.7
+                    sv_detection = sv.Detections(
+                        xyxy=candidate_boxes,
+                        confidence=dummy_confidence,
+                    )
                     detections = self.tracker.update_with_detections(sv_detection)
+
                     pos_dict = {}
                     for box, id in zip(detections.xyxy, detections.tracker_id):
                         x1, y1, x2, y2 = box
@@ -797,7 +893,7 @@ class SteeringNode(Node):
                 self.detection_timestamp_queue.append(image_timestamp)
                 self.detection_receipt_ros_queue.append(image_receipt_ros)
                 self.detection_receipt_steady_queue.append(image_receipt_steady)
-                base_pose_world = self.get_base_pose_world(image_timestamp)
+                base_pose_world = current_base_pose_world
                 camera_pose_world = (
                     None if base_pose_world is None
                     else base_pose_world @ self.T_base_from_cam
@@ -924,8 +1020,10 @@ class SteeringNode(Node):
                 if self.no_velocity:
                     trajectory_points = points_input
                     point_movement_bev = []
+                    dynamic_projection_mask = np.zeros(points_input.shape[:2], dtype=bool)
                 else:
                     # Update points according to detected obstacle velocities.
+                    unprojected_points = points_input.copy()
                     trajectory_points, point_movement_cam = update_points(
                         points_input,
                         self.detection_queue,
@@ -934,8 +1032,15 @@ class SteeringNode(Node):
                         detection_timestamps=self.detection_timestamp_queue,
                         camera_poses_world=self.detection_camera_pose_queue,
                         last_n_records=2,
-                        velocity_window=5,
+                        # Roughly one second of observations smooths detector-box
+                        # and monocular-depth jitter without trusting one frame.
+                        velocity_window=9,
                         min_dynamic_observations=3,
+                        min_velocity_interval=0.075,
+                        # Monocular depth varies slightly from frame to frame.
+                        # A 0.1 m/s cutoff regularly turns that scale noise into
+                        # motion on a stationary person while the robot drives.
+                        min_dynamic_speed=0.25,
                         max_dynamic_speed=3.0,
                         time_look_ahead=self.time_look_ahead,
                         debug_motion=self.debug_object_motion,
@@ -947,10 +1052,37 @@ class SteeringNode(Node):
                         )
                         for prev_point, after_point in point_movement_cam
                     ]
+                    dynamic_projection_mask = np.any(
+                        ~np.isclose(trajectory_points, unprojected_points, equal_nan=True),
+                        axis=-1,
+                    )
 
-                esdf_result, init_path_xy, opt_path_xy = update_trajectories(
+                temporal_deformation = None
+                temporal_age = None
+                if (
+                    self.previous_path_deformation is not None
+                    and self.previous_path_pose_world is not None
+                    and self.previous_path_timestamp is not None
+                    and current_base_pose_world is not None
+                    and self.previous_path_deformation.shape == vla_path[:, :2].shape
+                ):
+                    temporal_age = image_timestamp - self.previous_path_timestamp
+                    if 0.0 <= temporal_age <= 0.5:
+                        temporal_deformation = rotate_path_deformation_between_base_frames(
+                            self.previous_path_deformation,
+                            self.previous_path_pose_world,
+                            current_base_pose_world,
+                        )
+                        # Temporal memory represents only the previous left/right
+                        # choice. Forward placement comes from the current path.
+                        temporal_deformation[:, 0] = 0.0
+
+                esdf_result, init_path_xy, opt_path_xy, untruncated_path_xy = update_trajectories(
                     args, trajectory_points, estimated_cam_matrix, vla_path,
-                    n_iter=20, time_session=False, fix_end=args.fix_end)
+                    n_iter=20, time_session=False, fix_end=args.fix_end,
+                    temporal_deformation=temporal_deformation,
+                    temporal_age=temporal_age,
+                    dynamic_projection_mask=dynamic_projection_mask)
                 if self.show_time_performance:
                     t4 = time.perf_counter()
                     self.get_logger().info(f"update_trajectories took {(t4 - t3) * 1000:.1f} ms")
@@ -960,11 +1092,34 @@ class SteeringNode(Node):
                     target_distance=self.lookahead_distance,
                 )
                 if self.debug_waypoints:
+                    temporal_deformation_norms = (
+                        None if temporal_deformation is None
+                        else np.linalg.norm(temporal_deformation, axis=1).tolist()
+                    )
+                    temporal_lateral_deformation = (
+                        None if temporal_deformation is None
+                        else temporal_deformation[:, 1].tolist()
+                    )
                     self.get_logger().info(
                         "[waypoint-debug] selected waypoint "
                         f"waypoint={chosen_waypoint.flatten().tolist()} "
-                        f"target_distance={self.lookahead_distance:.3f}"
+                        f"target_distance={self.lookahead_distance:.3f} "
+                        f"temporal_age={temporal_age} "
+                        f"carried_deformation_norms={temporal_deformation_norms} "
+                        f"carried_lateral_deformation={temporal_lateral_deformation}"
                     )
+
+                if current_base_pose_world is not None:
+                    self.previous_path_deformation = (
+                        np.asarray(untruncated_path_xy, dtype=np.float64)
+                        - np.asarray(init_path_xy, dtype=np.float64)
+                    )
+                    self.previous_path_pose_world = current_base_pose_world.copy()
+                    self.previous_path_timestamp = image_timestamp
+                else:
+                    self.previous_path_deformation = None
+                    self.previous_path_pose_world = None
+                    self.previous_path_timestamp = None
 
                 # visualization code
                 if self.visualize:
@@ -1058,6 +1213,11 @@ if __name__ == "__main__":
         "--debug-motion",
         action="store_true",
         help="Log optimized paths, waypoint spacing, folds, and waypoint selection.",
+    )
+    parser.add_argument(
+        "--debug-object-motion",
+        action="store_true",
+        help="Log detection tracks, pose alignment, and object velocity estimates.",
     )
     parser.add_argument(
         "--no-velocity",

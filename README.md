@@ -135,6 +135,15 @@ predicts obstacle motion, and calls `update_trajectories`. The optimized path is
 then reduced to the configured arc-length lookahead waypoint and published.
 
 `--no-velocity` skips Florence-2, tracking, and velocity adjustment, passing the
-original depth points directly to `update_trajectories`. `--debug-motion` adds
-pose, twist, timestamp, and track diagnostics. Visualization is currently always
-on.
+original depth points directly to `update_trajectories`. `--debug-motion` reports
+the optimized path, segment lengths, turn cosines, temporal prior, and selected
+waypoint. The temporal prior carries the previous path deformation into the
+current robot frame and resists per-waypoint side reversals during every Adam
+update without pulling farther toward the previous offset. The prior acts
+where its native metric clearance satisfies the safety margin, and
+the untruncated optimized path preserves the chosen side across safety stops.
+The optimizer also projects each iteration to keep
+waypoint x coordinates nondecreasing, preventing a truncated feasible path
+from pointing back toward the robot. The final feasible-prefix gate requires
+one robot radius of additional metric clearance beyond the inflated footprint.
+Visualization is currently always on.

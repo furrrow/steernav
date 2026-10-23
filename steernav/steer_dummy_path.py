@@ -17,7 +17,7 @@ from transformers import AutoProcessor, AutoModelForCausalLM
 import matplotlib
 # Respect the backend selected by the importing application. ros_inference
 # selects Agg so it can run on a headless robot.
-from scipy.ndimage import zoom, gaussian_filter
+from scipy.ndimage import zoom, gaussian_filter, distance_transform_edt
 from scipy.spatial import cKDTree
 from moge.model.v2 import MoGeModel
 import supervision as sv
@@ -292,6 +292,97 @@ def sample_mesh_z_and_gradient(path_xy: np.ndarray, valid_mesh: ValidESDFMesh, e
     grad_dir = np.divide(grad_xy, norms, out=np.zeros_like(grad_xy), where=norms > 1e-6)
     return z_scaled, grad_xy, grad_dir
 
+
+def sample_bev_map(
+        path_xy: np.ndarray,
+        values: np.ndarray,
+        args: Namespace,
+        grid_cell_centers: bool = False,
+) -> np.ndarray:
+    """Bilinearly sample a BEV map at path coordinates."""
+    values = np.asarray(values)
+    rows, cols = values.shape
+    if grid_cell_centers:
+        col_f = (path_xy[:, 0] - args.x_min) / args.resolution - 0.5
+        row_f = (path_xy[:, 1] - args.y_min) / args.resolution - 0.5
+    else:
+        col_f = (path_xy[:, 0] - args.x_min) / max(1e-6, args.x_max - args.x_min) * (cols - 1)
+        row_f = (path_xy[:, 1] - args.y_min) / max(1e-6, args.y_max - args.y_min) * (rows - 1)
+    col_f = np.clip(col_f, 0.0, cols - 1.0)
+    row_f = np.clip(row_f, 0.0, rows - 1.0)
+    c0 = np.floor(col_f).astype(np.int32)
+    r0 = np.floor(row_f).astype(np.int32)
+    c1 = np.clip(c0 + 1, 0, cols - 1)
+    r1 = np.clip(r0 + 1, 0, rows - 1)
+    wc = col_f - c0
+    wr = row_f - r0
+    return (
+        (1.0 - wr) * ((1.0 - wc) * values[r0, c0] + wc * values[r0, c1])
+        + wr * ((1.0 - wc) * values[r1, c0] + wc * values[r1, c1])
+    )
+
+
+def blocked_waypoint_diagnostics(
+        path_xy: np.ndarray,
+        z_scaled: np.ndarray,
+        safety_clearance: np.ndarray,
+        blocked_indices: np.ndarray,
+        esdf_result: dict,
+        smoothed_clearance: np.ndarray,
+        args: Namespace,
+) -> list[dict]:
+    """Describe the ESDF evidence at each blocked optimized waypoint."""
+    if len(blocked_indices) == 0:
+        return []
+
+    occupied = np.asarray(esdf_result["occupied_mask"], dtype=bool)
+    visible_free = np.asarray(esdf_result["visible_free_mask"], dtype=bool)
+    unknown = np.asarray(esdf_result["unknown_mask"], dtype=bool)
+    dynamic = np.asarray(esdf_result["dynamic_occupied_mask"], dtype=bool)
+    invalid = occupied | unknown
+    _distance, nearest_invalid = distance_transform_edt(
+        ~invalid, return_indices=True
+    )
+    native_samples = sample_bev_map(
+        path_xy, esdf_result["clearance"], args, grid_cell_centers=True
+    )
+    smoothed_samples = sample_bev_map(path_xy, smoothed_clearance, args)
+
+    rows, cols = occupied.shape
+    col = np.clip(
+        np.floor((path_xy[:, 0] - args.x_min) / args.resolution).astype(np.int32),
+        0, cols - 1,
+    )
+    row = np.clip(
+        np.floor((path_xy[:, 1] - args.y_min) / args.resolution).astype(np.int32),
+        0, rows - 1,
+    )
+    diagnostics = []
+    for index in blocked_indices:
+        r, c = int(row[index]), int(col[index])
+        nearest_r = int(nearest_invalid[0, r, c])
+        nearest_c = int(nearest_invalid[1, r, c])
+        classification = (
+            "occupied" if occupied[r, c]
+            else "visible_free" if visible_free[r, c]
+            else "unknown"
+        )
+        diagnostics.append({
+            "index": int(index),
+            "xy": path_xy[index].tolist(),
+            "z_scaled": float(z_scaled[index]),
+            "safety_clearance": float(safety_clearance[index]),
+            "native_clearance": float(native_samples[index]),
+            "smoothed_clearance": float(smoothed_samples[index]),
+            "classification": classification,
+            "dynamic_projected_at_cell": bool(dynamic[r, c]),
+            "nearest_invalid_classification": (
+                "occupied" if occupied[nearest_r, nearest_c] else "unknown"
+            ),
+            "nearest_invalid_dynamic_projection": bool(dynamic[nearest_r, nearest_c]),
+        })
+    return diagnostics
+
 def get_path_update_scale(
     path: np.ndarray,
     min_scale: float = 0.1,
@@ -352,6 +443,101 @@ def constrain_path_segment_lengths(
     return constrained
 
 
+def constrain_path_forward_progress(
+        path: np.ndarray,
+        min_forward_step: float = 0.0,
+        preserve_end: bool = False,
+) -> np.ndarray:
+    """Ensure waypoint order never moves backward along the robot X axis.
+
+    Correcting a violation translates the remaining suffix, preserving all
+    later segment vectors. With a fixed endpoint, the equivalent backward
+    sweep translates the preceding prefix instead.
+    """
+    if not np.isfinite(min_forward_step) or min_forward_step < 0.0:
+        raise ValueError("min_forward_step must be finite and nonnegative")
+
+    constrained = np.asarray(path, dtype=np.float64).copy()
+    if len(constrained) < 2:
+        return constrained
+
+    if preserve_end:
+        for index in range(len(constrained) - 2, -1, -1):
+            maximum_x = constrained[index + 1, 0] - min_forward_step
+            if constrained[index, 0] > maximum_x:
+                correction = maximum_x - constrained[index, 0]
+                constrained[:index + 1, 0] += correction
+    else:
+        for index in range(1, len(constrained)):
+            minimum_x = constrained[index - 1, 0] + min_forward_step
+            if constrained[index, 0] < minimum_x:
+                correction = minimum_x - constrained[index, 0]
+                constrained[index:, 0] += correction
+    return constrained
+
+
+def constrain_path_turn_angles(
+        path: np.ndarray,
+        min_turn_cosine: float = 0.5,
+        preserve_end: bool = False,
+        eps: float = 1e-8,
+) -> np.ndarray:
+    """Project consecutive segments to a maximum turning angle.
+
+    A minimum cosine of 0.5 limits each turn to 60 degrees. The forward sweep
+    preserves the first two waypoints; reversing the sweep preserves the final
+    two when the endpoint is fixed.
+    """
+    if not np.isfinite(min_turn_cosine) or not -1.0 <= min_turn_cosine <= 1.0:
+        raise ValueError("min_turn_cosine must be finite and between -1 and one")
+
+    constrained = np.asarray(path, dtype=np.float64).copy()
+    if len(constrained) < 3:
+        return constrained
+    if preserve_end:
+        constrained = constrained[::-1].copy()
+
+    max_sine = np.sqrt(max(0.0, 1.0 - min_turn_cosine ** 2))
+    for center_index in range(1, len(constrained) - 1):
+        incoming = constrained[center_index] - constrained[center_index - 1]
+        outgoing = constrained[center_index + 1] - constrained[center_index]
+        incoming_length = np.linalg.norm(incoming)
+        outgoing_length = np.linalg.norm(outgoing)
+        if incoming_length <= eps or outgoing_length <= eps:
+            continue
+
+        incoming_direction = incoming / incoming_length
+        outgoing_direction = outgoing / outgoing_length
+        cosine = float(np.dot(incoming_direction, outgoing_direction))
+        if cosine >= min_turn_cosine:
+            continue
+
+        cross = (
+            incoming_direction[0] * outgoing_direction[1]
+            - incoming_direction[1] * outgoing_direction[0]
+        )
+        if abs(cross) <= eps:
+            corrected_direction = incoming_direction
+        else:
+            turn_sign = np.sign(cross)
+            left_normal = np.array(
+                [-incoming_direction[1], incoming_direction[0]],
+                dtype=np.float64,
+            )
+            corrected_direction = (
+                min_turn_cosine * incoming_direction
+                + turn_sign * max_sine * left_normal
+            )
+        corrected_next = (
+            constrained[center_index]
+            + outgoing_length * corrected_direction
+        )
+        correction = corrected_next - constrained[center_index + 1]
+        constrained[center_index + 1:] += correction
+
+    return constrained[::-1].copy() if preserve_end else constrained
+
+
 def negative_turn_gradient(
         path: np.ndarray,
         eps: float = 1e-8,
@@ -401,23 +587,61 @@ def negative_turn_gradient(
     return gradient, turn_cosines
 
 
-def constrain_path_to_feasible_prefix(
+def temporal_lateral_gradient(
         path: np.ndarray,
-        z_scaled: np.ndarray,
-        blocked_threshold: float = 0.03,
+        baseline: np.ndarray,
+        reference: np.ndarray,
+        point_weights: np.ndarray,
 ) -> np.ndarray:
-    """Stop at the first waypoint that does not satisfy the ESDF criterion.
+    """Penalize safe per-waypoint reversals without amplifying prior offsets."""
+    path = np.asarray(path, dtype=np.float64)
+    baseline = np.asarray(baseline, dtype=np.float64)
+    reference = np.asarray(reference, dtype=np.float64)
+    point_weights = np.asarray(point_weights, dtype=np.float64)
+    if baseline.shape != path.shape or reference.shape != path.shape:
+        raise ValueError("baseline and reference must have the same shape as path")
+    if point_weights.shape != (len(path),):
+        raise ValueError("point_weights must have shape (N,)")
 
-    A fully blocked path is represented by zero waypoints, which downstream
-    waypoint selection and control interpret as a stop command. Small positive
-    values up to ``blocked_threshold`` are accepted to prevent ESDF noise near
-    zero from toggling the controller between driving and stopping.
+    previous_lateral = reference[:, 1] - baseline[:, 1]
+    current_lateral = path[:, 1] - baseline[:, 1]
+    crossed_to_opposite_side = previous_lateral * current_lateral < 0.0
+    gradient = np.zeros_like(path)
+    gradient[crossed_to_opposite_side, 1] = (
+        point_weights[crossed_to_opposite_side]
+        * current_lateral[crossed_to_opposite_side]
+    )
+    return gradient
+
+
+def temporal_clearance_weights(
+        reference_clearance: np.ndarray,
+        minimum_clearance: float,
+) -> np.ndarray:
+    """Use temporal momentum only while its reference remains safely traversable."""
+    reference_clearance = np.asarray(reference_clearance, dtype=np.float64)
+    safe = reference_clearance > minimum_clearance
+    return safe.astype(np.float64)
+
+
+def constrain_path_to_clearance_prefix(
+        path: np.ndarray,
+        clearance: np.ndarray,
+        minimum_clearance: float = 0.0,
+) -> np.ndarray:
+    """Stop at the first waypoint without sufficient metric clearance.
+
+    Clearance has already had the robot radius subtracted. Values at or below
+    ``minimum_clearance`` are therefore unsafe; positive values are feasible.
     """
-    if len(path) != len(z_scaled):
-        raise ValueError("path and z_scaled must contain the same number of points")
+    if len(path) != len(clearance):
+        raise ValueError("path and clearance must contain the same number of points")
+    if not np.isfinite(minimum_clearance):
+        raise ValueError("minimum_clearance must be finite")
 
-    feasible = np.asarray(z_scaled) <= blocked_threshold
-    blocked_indices = np.flatnonzero(~feasible)
+    blocked_indices = np.flatnonzero(
+        np.asarray(clearance) <= minimum_clearance
+    )
     if len(blocked_indices) == 0:
         return path
 
@@ -428,6 +652,16 @@ def constrain_path_to_feasible_prefix(
     path = path.copy()
     path[first_blocked_idx:] = path[first_blocked_idx - 1]
     return path
+
+
+def safety_clearance_margin(
+        robot_radius: float,
+) -> float:
+    """Require one robot radius of clearance beyond the inflated footprint."""
+    robot_radius = float(robot_radius)
+    if not np.isfinite(robot_radius) or robot_radius < 0.0:
+        raise ValueError("robot_radius must be finite and nonnegative")
+    return robot_radius
 
 def adam_update_numpy(
         path_xy: np.ndarray,
@@ -447,12 +681,32 @@ def adam_update_numpy(
         blocked_threshold: float = 0.03,
         debug_motion: bool = False,
         max_segment_length: float | None = None,
-) -> np.ndarray:
+        temporal_reference: np.ndarray | None = None,
+        temporal_point_weights: np.ndarray | None = None,
+        temporal_age: float | None = None,
+        min_turn_cosine: float = 0.5,
+        min_update_scale: float = 0.2,
+        esdf_result: dict | None = None,
+        smoothed_clearance: np.ndarray | None = None,
+        args: Namespace | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
     """
     Optimizes path_xy using Adam optimization.
     Drastically accelerates convergence compared to standard gradient descent.
     """
     path = path_xy.copy()
+    if temporal_reference is not None:
+        temporal_reference = np.asarray(temporal_reference, dtype=np.float64)
+        if temporal_reference.shape != path.shape:
+            raise ValueError("temporal_reference must have the same shape as path_xy")
+        if temporal_point_weights is None:
+            temporal_point_weights = np.ones(len(path), dtype=np.float64)
+        else:
+            temporal_point_weights = np.asarray(temporal_point_weights, dtype=np.float64)
+            if temporal_point_weights.shape != (len(path),):
+                raise ValueError("temporal_point_weights must have shape (N,)")
+    if not np.isfinite(min_update_scale) or not 0.0 <= min_update_scale <= 1.0:
+        raise ValueError("min_update_scale must be finite and between zero and one")
     if max_segment_length is None and len(path) > 1:
         max_segment_length = float(np.max(np.linalg.norm(np.diff(path, axis=0), axis=1)))
 
@@ -480,7 +734,6 @@ def adam_update_numpy(
         # segment. This discourages path fold-over without flattening valid
         # positive-angle turns.
         turn_gradient, _ = negative_turn_gradient(path, eps=eps)
-
         # 3. Total Loss Gradient: grad_xy pushes AWAY from cost (+), smooth_force pulls towards neighbors (-)
         # We want to minimize cost, so total gradient = grad_xy - smooth_weight * smooth_force
         grad_total = (
@@ -488,6 +741,13 @@ def adam_update_numpy(
             - smooth_weight * smooth_force
             + turn_weight * turn_gradient
         )
+        if temporal_reference is not None:
+            grad_total += temporal_lateral_gradient(
+                path,
+                path_xy,
+                temporal_reference,
+                temporal_point_weights,
+            )
 
         if fix_beginning:
             grad_total[0:1] = 0.0
@@ -503,7 +763,12 @@ def adam_update_numpy(
         v_hat = v / (1.0 - beta2 ** t)
 
         # 5. Parameter Update
-        update_scale = get_path_update_scale(path, min_scale=0.05, max_scale=1.0, power=1.5)
+        update_scale = get_path_update_scale(
+            path,
+            min_scale=min_update_scale,
+            max_scale=1.0,
+            power=1.5,
+        )
         path -= update_scale * lr * m_hat / (np.sqrt(v_hat) + eps)
         path = constrain_xy_to_esdf(path, valid_mesh)
         if max_segment_length is not None:
@@ -512,13 +777,34 @@ def adam_update_numpy(
                 max_segment_length=max_segment_length,
                 preserve_end=fix_end,
             )
+        path = constrain_path_turn_angles(
+            path,
+            min_turn_cosine=min_turn_cosine,
+            preserve_end=fix_end,
+        )
+        path = constrain_path_forward_progress(path, preserve_end=fix_end)
+        path = constrain_xy_to_esdf(path, valid_mesh)
 
-    # Only the contiguous feasible prefix is safe to follow; feasibility later
-    # in a blocked path is irrelevant. Allow a small positive tolerance because
-    # the projected ESDF near zero varies slightly from frame to frame.
+    # z_scaled shapes the optimization surface, but its free-space compression
+    # and frame-dependent offset mean it is not a metric safety value. Apply
+    # the final feasible-prefix gate to native clearance in metres instead.
     z_scaled, _, _ = sample_mesh_z_and_gradient(path, valid_mesh, esdf_height_scale)
+    if esdf_result is None or args is None:
+        raise ValueError(
+            "esdf_result and args are required for metric path feasibility"
+        )
+    safety_clearance = sample_bev_map(
+        path,
+        esdf_result["clearance"],
+        args,
+        grid_cell_centers=True,
+    )
+    minimum_clearance = safety_clearance_margin(args.robot_radius)
+    safety_blocked_indices = np.flatnonzero(
+        safety_clearance <= minimum_clearance
+    )
+    surface_blocked_indices = np.flatnonzero(z_scaled > blocked_threshold)
     if debug_motion:
-        blocked_indices = np.flatnonzero(z_scaled > blocked_threshold)
         segment_vectors = np.diff(path, axis=0)
         segment_lengths = np.linalg.norm(segment_vectors, axis=1)
         turn_denominators = segment_lengths[:-1] * segment_lengths[1:]
@@ -529,6 +815,11 @@ def adam_update_numpy(
             where=turn_denominators > eps,
         )
         reversal_indices = (np.flatnonzero(turn_cosines < 0.0) + 1).tolist()
+        backward_segment_indices = np.flatnonzero(segment_vectors[:, 0] < -eps).tolist()
+        temporal_offset = (
+            None if temporal_reference is None
+            else temporal_reference - np.asarray(path_xy, dtype=np.float64)
+        )
         print(
             "[waypoint-debug] optimized path "
             f"input_path_xy={np.asarray(path_xy).tolist()} "
@@ -536,22 +827,49 @@ def adam_update_numpy(
             f"segment_lengths={segment_lengths.tolist()} "
             f"max_segment_length={max_segment_length} "
             f"turn_weight={turn_weight} "
+            f"min_turn_cosine={min_turn_cosine} "
+            f"min_update_scale={min_update_scale} "
+            f"final_update_scales="
+            f"{get_path_update_scale(path, min_scale=min_update_scale, max_scale=1.0, power=1.5).ravel().tolist()} "
+            f"temporal_age={temporal_age} "
+            f"temporal_reference={None if temporal_reference is None else temporal_reference.tolist()} "
+            f"temporal_point_weights={None if temporal_point_weights is None else temporal_point_weights.tolist()} "
+            f"temporal_offset={None if temporal_offset is None else temporal_offset.tolist()} "
             f"turn_cosines={turn_cosines.tolist()} "
             f"reversal_waypoint_indices={reversal_indices} "
+            f"forward_deltas={segment_vectors[:, 0].tolist()} "
+            f"backward_segment_indices={backward_segment_indices} "
             f"z_scaled={z_scaled.tolist()} "
-            f"blocked_threshold={blocked_threshold} "
-            f"blocked_indices={blocked_indices.tolist()} "
+            f"surface_blocked_threshold={blocked_threshold} "
+            f"surface_blocked_indices={surface_blocked_indices.tolist()} "
+            f"safety_clearance={safety_clearance.tolist()} "
+            f"robot_radius={args.robot_radius} "
+            f"minimum_clearance={minimum_clearance} "
+            f"safety_blocked_indices={safety_blocked_indices.tolist()} "
             f"first_blocked_idx="
-            f"{None if len(blocked_indices) == 0 else int(blocked_indices[0])}"
+            f"{None if len(safety_blocked_indices) == 0 else int(safety_blocked_indices[0])}"
         )
-    path = constrain_path_to_feasible_prefix(
-        path,
-        z_scaled,
-        blocked_threshold=blocked_threshold,
+        if (
+            len(safety_blocked_indices) > 0
+            and smoothed_clearance is not None
+        ):
+            print(
+                "[waypoint-debug] blocked waypoint ESDF "
+                f"diagnostics={blocked_waypoint_diagnostics(path, z_scaled, safety_clearance, safety_blocked_indices, esdf_result, smoothed_clearance, args)}",
+                flush=True,
+            )
+    untruncated_path = path.copy()
+    safe_path = constrain_path_to_clearance_prefix(
+        untruncated_path,
+        safety_clearance,
+        minimum_clearance=minimum_clearance,
     )
-    if not np.any(z_scaled <= blocked_threshold):
-        print(f"No feasible path: z_scaled={z_scaled}; commanding stop")
-    return path
+    if not np.any(safety_clearance > minimum_clearance):
+        print(
+            "No feasible path: "
+            f"safety_clearance={safety_clearance}; commanding stop"
+        )
+    return safe_path, untruncated_path
 
 
 def update_trajectories(args: Namespace,
@@ -564,6 +882,9 @@ def update_trajectories(args: Namespace,
                         free_space_scaling_factor: float=0.25,
                         smooth_weight: float = 0.2,
                         fix_end: bool = False,
+                        temporal_deformation: ndarray | None = None,
+                        temporal_age: float | None = None,
+                        dynamic_projection_mask: ndarray | None = None,
                         ) -> tuple[
     dict[str, Tensor], ndarray, ndarray]:
     t0 = time.perf_counter()
@@ -573,7 +894,9 @@ def update_trajectories(args: Namespace,
                                               R=rotation, t=translation,
                                               x_min=args.x_min, x_max=args.x_max,
                                               y_min=args.y_min, y_max=args.y_max,
+                                              resolution=args.resolution,
                                               robot_radius=args.robot_radius,
+                                              dynamic_projection_mask=dynamic_projection_mask,
                                               )
     if time_session:
         t1 = time.perf_counter()
@@ -590,20 +913,51 @@ def update_trajectories(args: Namespace,
     max_segment_length = (
         float(np.max(input_segment_lengths)) if len(input_segment_lengths) > 0 else None
     )
+    temporal_reference = None
+    temporal_point_weights = None
+    if temporal_deformation is not None:
+        temporal_deformation = np.asarray(temporal_deformation, dtype=np.float64)
+        if temporal_deformation.shape != init_path_xy.shape:
+            raise ValueError("temporal_deformation must have the same shape as the path")
+        temporal_reference = init_path_xy + temporal_deformation
+        temporal_clearance = sample_bev_map(
+            temporal_reference,
+            esdf_result["clearance"],
+            args,
+            grid_cell_centers=True,
+        )
+        temporal_point_weights = temporal_clearance_weights(
+            temporal_clearance,
+            safety_clearance_margin(args.robot_radius),
+        )
+        if bool(getattr(args, "debug_motion", False)):
+            print(
+                "[waypoint-debug] temporal gate "
+                f"deformation={temporal_deformation.tolist()} "
+                f"reference_clearance={temporal_clearance.tolist()} "
+                f"point_weights={temporal_point_weights.tolist()}"
+            )
     # Optimize path using ESDF gradients
     # numpy version, n_iter=5, 1.3ms
-    opt_path_xy = adam_update_numpy(path_xy=init_path_xy, valid_mesh=valid_mesh,
+    opt_path_xy, untruncated_path_xy = adam_update_numpy(path_xy=init_path_xy, valid_mesh=valid_mesh,
                                     esdf_height_scale=args.esdf_height_scale,
                                     lr=lr, smooth_weight=smooth_weight,
                                     iterations=n_iter,
                                     fix_end=fix_end,
                                     max_segment_length=max_segment_length,
+                                    temporal_reference=temporal_reference,
+                                    temporal_point_weights=temporal_point_weights,
+                                    temporal_age=temporal_age,
+                                    min_update_scale=0.2,
+                                    esdf_result=esdf_result,
+                                    smoothed_clearance=mesh.esdf,
+                                    args=args,
                                     debug_motion=bool(getattr(args, "debug_motion", False)))
     if time_session:
         t3 = time.perf_counter()
         print(f"constrain path, adam_update_numpy {(t3 - t2) * 1000:.1f} ms")
         print(f"total time before rendering {(t3 - t0) * 1000:.1f} ms")
-    return esdf_result, init_path_xy, opt_path_xy
+    return esdf_result, init_path_xy, opt_path_xy, untruncated_path_xy
 
 def transform_point(T_base_from_cam: np.ndarray, point_cam: np.ndarray) -> np.ndarray:
     point_h = np.append(point_cam, 1.0)   # [x, y, z, 1]
@@ -815,10 +1169,10 @@ def main() -> int:
                 )
                 for prev_point, after_point in point_movement_cam
             ]
-            static_esdf_result, init_path_xy, static_path_xy = update_trajectories(
+            static_esdf_result, init_path_xy, static_path_xy, _ = update_trajectories(
                 args, points_input, estimated_cam_matrix, straight_path, time_session)
 
-            dynamic_esdf_result, init_path_xy, dynamic_path_xy = update_trajectories(
+            dynamic_esdf_result, init_path_xy, dynamic_path_xy, _ = update_trajectories(
                 args, updated_points, estimated_cam_matrix, straight_path, time_session)
 
             # add estimated intrinsics
