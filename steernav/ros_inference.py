@@ -38,6 +38,13 @@ from moge.model.v2 import MoGeModel
 import supervision as sv
 from steer_dummy_path import update_trajectories, transform_point
 from custom_utils.pointcloud_utils import update_points
+from sim_pedestrians import (
+    advance_pedestrian_states,
+    closest_pedestrian_snapshot,
+    match_pedestrians_to_tracks,
+    parse_pedestrian_state,
+    pedestrian_states_in_camera,
+)
 
 
 def resample_path(path, num_waypoints: int = 8, eps: float = 1e-8) -> np.ndarray:
@@ -159,6 +166,28 @@ def quaternion_to_rotation_matrix(quaternion_xyzw):
     ])
 
 
+def rotation_vector_to_matrix(rotation_vector):
+    """Convert a body-frame rotation vector to a 3-by-3 rotation matrix."""
+    rotation_vector = np.asarray(rotation_vector, dtype=np.float64)
+    if rotation_vector.shape != (3,) or not np.isfinite(rotation_vector).all():
+        raise ValueError("rotation_vector must be a finite vector with shape (3,)")
+    angle = float(np.linalg.norm(rotation_vector))
+    if angle < 1e-12:
+        return np.eye(3, dtype=np.float64)
+    axis = rotation_vector / angle
+    x, y, z = axis
+    cross_matrix = np.array([
+        [0.0, -z, y],
+        [z, 0.0, -x],
+        [-y, x, 0.0],
+    ])
+    return (
+        np.eye(3, dtype=np.float64)
+        + np.sin(angle) * cross_matrix
+        + (1.0 - np.cos(angle)) * (cross_matrix @ cross_matrix)
+    ) # Rodrigues’ formula
+
+
 def interpolate_pose_samples(pose_samples, timestamp, max_endpoint_gap=0.1):
     """Interpolate a pose, allowing a nearby endpoint when one side is absent."""
     if not pose_samples:
@@ -211,37 +240,61 @@ def interpolate_pose_samples(pose_samples, timestamp, max_endpoint_gap=0.1):
     return transform
 
 
-def interpolate_vector_samples(samples, timestamp, max_endpoint_gap=0.1):
-    """Linearly interpolate timestamped vectors with bounded endpoint reuse."""
-    if not samples:
-        return None
-    times = np.asarray([sample[0] for sample in samples], dtype=np.float64)
+def pose_at_timestamp(
+    pose_samples,
+    linear_velocity_samples,
+    angular_velocity_samples,
+    timestamp,
+    max_extrapolation=0.25,
+):
+    """Interpolate a pose or extrapolate a recent trailing odometry sample.
+
+    Odometry twist is expressed in the base frame.  A bounded extrapolation is
+    needed when an image callback runs before the odometry callback carrying
+    the same simulator timestamp.
+    """
+    pose = interpolate_pose_samples(pose_samples, timestamp, max_endpoint_gap=0.0)
+    if pose is not None or not pose_samples:
+        return pose
+
     timestamp = float(timestamp)
-    right = int(np.searchsorted(times, timestamp, side="left"))
-    if right < len(times) and abs(times[right] - timestamp) <= 1e-9:
-        return np.asarray(samples[right][1], dtype=np.float64).copy()
-    if right == 0 or right == len(times):
-        endpoint = 0 if right == 0 else len(times) - 1
-        if abs(timestamp - times[endpoint]) > float(max_endpoint_gap):
-            return None
-        return np.asarray(samples[endpoint][1], dtype=np.float64).copy()
-    left = right - 1
-    interval = times[right] - times[left]
-    if interval <= 1e-9:
+    latest_timestamp = float(pose_samples[-1][0])
+    dt = timestamp - latest_timestamp
+    if dt <= 0.0 or dt > float(max_extrapolation):
         return None
-    fraction = (timestamp - times[left]) / interval
-    return (
-        (1.0 - fraction) * np.asarray(samples[left][1], dtype=np.float64)
-        + fraction * np.asarray(samples[right][1], dtype=np.float64)
+    if not linear_velocity_samples or not angular_velocity_samples:
+        return None
+
+    latest_pose = interpolate_pose_samples(
+        pose_samples, latest_timestamp, max_endpoint_gap=0.0
     )
+    linear_velocity_base = np.asarray(
+        linear_velocity_samples[-1][1], dtype=np.float64
+    )
+    angular_velocity_base = np.asarray(
+        angular_velocity_samples[-1][1], dtype=np.float64
+    )
+    if (
+        linear_velocity_base.shape != (3,)
+        or angular_velocity_base.shape != (3,)
+        or not np.isfinite(linear_velocity_base).all()
+        or not np.isfinite(angular_velocity_base).all()
+    ):
+        return None
 
-
-def yaw_from_rotation(rotation):
-    """Return planar yaw from a 3-by-3 rotation matrix."""
-    rotation = np.asarray(rotation, dtype=np.float64)
-    if rotation.shape != (3, 3):
-        raise ValueError("rotation must have shape (3, 3)")
-    return float(np.arctan2(rotation[1, 0], rotation[0, 0]))
+    rotation_world_from_base = latest_pose[:3, :3]
+    midpoint_rotation = rotation_vector_to_matrix(
+        0.5 * dt * angular_velocity_base
+    )
+    extrapolated = latest_pose.copy()
+    extrapolated[:3, 3] += (
+        rotation_world_from_base @ midpoint_rotation @ linear_velocity_base * dt
+    )
+    extrapolated[:3, :3] = (
+        rotation_world_from_base
+        @ rotation_vector_to_matrix(dt * angular_velocity_base)
+    )
+    return extrapolated
 
 
 def rotate_path_deformation_between_base_frames(
@@ -361,22 +414,27 @@ class SteeringNode(Node):
         self.detection_queue = []
         self.detection_queue_len = 20
         self.detection_timestamp_queue = deque(maxlen=self.detection_queue_len)
-        self.detection_receipt_ros_queue = deque(maxlen=self.detection_queue_len)
-        self.detection_receipt_steady_queue = deque(maxlen=self.detection_queue_len)
-        self.detection_base_pose_queue = deque(maxlen=self.detection_queue_len)
         self.detection_camera_pose_queue = deque(maxlen=self.detection_queue_len)
         self.odom_pose_buffer = deque(maxlen=2000)
         self.odom_linear_velocity_buffer = deque(maxlen=2000)
         self.odom_angular_velocity_buffer = deque(maxlen=2000)
-        self.odom_receipt_time_buffer = deque(maxlen=2000)
-        self.odom_frame_id = ""
-        self.odom_child_frame_id = ""
-        self.latest_odom_timestamp = None
         self.previous_path_deformation = None
         self.previous_path_pose_world = None
         self.previous_path_timestamp = None
-        self.motion_track_debug_history = {}
-        self.motion_track_debug_active_ids = set()
+        self.object_velocity_source = getattr(args, "object_velocity_source", "estimated")
+        self.pedestrian_state_buffer = deque(maxlen=120)
+        self.pedestrian_state_max_age = float(getattr(args, "pedestrian_state_max_age", 0.1))
+        self.pedestrian_match_distance = float(getattr(args, "pedestrian_match_distance", 1.0))
+        self.odom_pose_max_extrapolation = float(getattr(args, "odom_pose_max_extrapolation", 0.25))
+        if not np.isfinite(self.pedestrian_state_max_age) or self.pedestrian_state_max_age < 0:
+            raise ValueError("pedestrian_state_max_age must be finite and nonnegative")
+        if not np.isfinite(self.pedestrian_match_distance) or self.pedestrian_match_distance <= 0:
+            raise ValueError("pedestrian_match_distance must be finite and positive")
+        if (
+            not np.isfinite(self.odom_pose_max_extrapolation)
+            or self.odom_pose_max_extrapolation < 0
+        ):
+            raise ValueError("odom_pose_max_extrapolation must be finite and nonnegative")
         # Estimate track motion from the central half of each detection. Large
         # grounding boxes often include background whose median depth can jump
         # between surfaces even when the box itself is stable.
@@ -390,10 +448,6 @@ class SteeringNode(Node):
         self.path_frame_id = "base_link"
         self._started_sent = False
         self.show_time_performance = False
-        self.debug_waypoints = args.debug_motion
-        self.debug_object_motion = bool(
-            getattr(args, "debug_object_motion", False)
-        )
         self.no_velocity = args.no_velocity
         self.time_look_ahead = args.time_look_ahead
         self.visualize = True
@@ -429,9 +483,8 @@ class SteeringNode(Node):
         self.T_cam_from_base = np.linalg.inv(self.T_base_from_cam)
         self.image_queue = deque(maxlen=self.buffer_size+1)
         self.image_timestamp_queue = deque(maxlen=self.buffer_size+1)
-        self.image_receipt_ros_queue = deque(maxlen=self.buffer_size+1)
-        self.image_receipt_steady_queue = deque(maxlen=self.buffer_size+1)
         self.paths_queue = deque(maxlen=self.buffer_size+1)
+        self.last_processed_image_timestamp = None
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print("Using device:", self.device)
         depth_model_name = model_params['depth_model_name']
@@ -462,7 +515,7 @@ class SteeringNode(Node):
             msg_type, IMAGE_TOPIC, self.img_callback_obs,
             qos_profile=QoSProfile(reliability=QoSReliabilityPolicy.BEST_EFFORT,
                                    history=QoSHistoryPolicy.KEEP_LAST,
-                                   depth=10))
+                                   depth=1))
         self.odom_sub = self.create_subscription(
             Odometry, ODOM_TOPIC, self.odom_callback_obs,
             qos_profile=QoSProfile(reliability=QoSReliabilityPolicy.BEST_EFFORT,
@@ -474,6 +527,7 @@ class SteeringNode(Node):
                                    history=QoSHistoryPolicy.KEEP_LAST,
                                    depth=10))
         self.episode_sub = None
+        self.pedestrian_state_sub = None
         if self.require_episode:
             episode_qos = QoSProfile(
                 reliability=QoSReliabilityPolicy.RELIABLE,
@@ -486,6 +540,18 @@ class SteeringNode(Node):
                 args.episode_topic,
                 self.episode_callback,
                 qos_profile=episode_qos,
+            )
+        if self.object_velocity_source == "sim-ground-truth":
+            pedestrian_qos = QoSProfile(
+                reliability=QoSReliabilityPolicy.BEST_EFFORT,
+                history=QoSHistoryPolicy.KEEP_LAST,
+                depth=1,
+            )
+            self.pedestrian_state_sub = self.create_subscription(
+                String,
+                getattr(args, "pedestrian_state_topic", "/isaacsim/pedestrians"),
+                self.pedestrian_state_callback,
+                qos_profile=pedestrian_qos,
             )
         # publishers:
         self.steered_waypoint_pub = self.create_publisher(
@@ -530,8 +596,6 @@ class SteeringNode(Node):
             self.get_logger().info("Published /started (once).")
 
     def img_callback_obs(self, msg: Image):
-        receipt_ros = self.get_clock().now().nanoseconds * 1e-9
-        receipt_steady = time.monotonic()
         if self.compressed_img_topic:
             self.obs_img = self.br.compressed_imgmsg_to_cv2(msg)
         else:
@@ -552,12 +616,8 @@ class SteeringNode(Node):
         if self.buffer_size is not None:
             self.image_queue.append(self.obs_img)
             self.image_timestamp_queue.append(image_timestamp)
-            self.image_receipt_ros_queue.append(receipt_ros)
-            self.image_receipt_steady_queue.append(receipt_steady)
 
     def odom_callback_obs(self, msg: Odometry):
-        receipt_ros = self.get_clock().now().nanoseconds * 1e-9
-        receipt_steady = time.monotonic()
         self.robot_velocity_base[:] = [
             msg.twist.twist.linear.x,
             msg.twist.twist.linear.y,
@@ -590,9 +650,6 @@ class SteeringNode(Node):
         self.odom_angular_velocity_buffer.append(
             (timestamp, self.robot_angular_velocity_base.copy())
         )
-        self.odom_receipt_time_buffer.append(
-            (timestamp, np.array([receipt_ros, receipt_steady], dtype=np.float64))
-        )
         if len(self.odom_pose_buffer) > 1 and timestamp < self.odom_pose_buffer[-2][0]:
             self.odom_pose_buffer = deque(
                 sorted(self.odom_pose_buffer, key=lambda item: item[0]), maxlen=2000
@@ -605,30 +662,18 @@ class SteeringNode(Node):
                 sorted(self.odom_angular_velocity_buffer, key=lambda item: item[0]),
                 maxlen=2000,
             )
-            self.odom_receipt_time_buffer = deque(
-                sorted(self.odom_receipt_time_buffer, key=lambda item: item[0]),
-                maxlen=2000,
-            )
-        frames_changed = (
-            msg.header.frame_id != self.odom_frame_id
-            or msg.child_frame_id != self.odom_child_frame_id
-        )
-        self.odom_frame_id = msg.header.frame_id
-        self.odom_child_frame_id = msg.child_frame_id
-        self.latest_odom_timestamp = timestamp
-        if self.debug_object_motion and frames_changed:
-            self.get_logger().info(
-                "[motion-debug] odom frames "
-                f"pose_frame={self.odom_frame_id!r} "
-                f"twist_frame={self.odom_child_frame_id!r}"
-            )
 
     def get_base_pose_world(self, timestamp):
         try:
-            return interpolate_pose_samples(self.odom_pose_buffer, timestamp)
+            return pose_at_timestamp(
+                self.odom_pose_buffer,
+                self.odom_linear_velocity_buffer,
+                self.odom_angular_velocity_buffer,
+                timestamp,
+                max_extrapolation=self.odom_pose_max_extrapolation,
+            )
         except ValueError as exc:
-            if self.debug_object_motion:
-                self.get_logger().warn(f"[motion-debug] invalid odometry pose: {exc}")
+            self.get_logger().warn(f"Invalid odometry pose: {exc}")
             return None
 
     def episode_callback(self, msg: String) -> None:
@@ -652,27 +697,18 @@ class SteeringNode(Node):
         self.episode_id = episode_id
         self.image_queue.clear()
         self.image_timestamp_queue.clear()
-        self.image_receipt_ros_queue.clear()
-        self.image_receipt_steady_queue.clear()
+        self.last_processed_image_timestamp = None
         self.paths_queue.clear()
         self.detection_queue.clear()
         self.detection_timestamp_queue.clear()
-        self.detection_receipt_ros_queue.clear()
-        self.detection_receipt_steady_queue.clear()
-        self.detection_base_pose_queue.clear()
         self.detection_camera_pose_queue.clear()
         self.odom_pose_buffer.clear()
         self.odom_linear_velocity_buffer.clear()
         self.odom_angular_velocity_buffer.clear()
-        self.odom_receipt_time_buffer.clear()
-        self.odom_frame_id = ""
-        self.odom_child_frame_id = ""
-        self.latest_odom_timestamp = None
         self.previous_path_deformation = None
         self.previous_path_pose_world = None
         self.previous_path_timestamp = None
-        self.motion_track_debug_history.clear()
-        self.motion_track_debug_active_ids.clear()
+        self.pedestrian_state_buffer.clear()
         self.tracker = sv.ByteTrack()
         self.robot_velocity_base.fill(0.0)
         self.robot_angular_velocity_base.fill(0.0)
@@ -681,6 +717,25 @@ class SteeringNode(Node):
         stop.data = [0.0, 0.0]
         self.steered_waypoint_pub.publish(stop)
         self.get_logger().info(f"Reset steering state for episode {episode_id}")
+
+    def pedestrian_state_callback(self, msg: String) -> None:
+        """Validate and buffer one Isaac pedestrian-state snapshot."""
+        try:
+            timestamp, episode_id, pedestrians = parse_pedestrian_state(msg.data)
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+            self.get_logger().error(f"Invalid pedestrian state: {exc}")
+            return
+        if episode_id != self.episode_id:
+            return
+        self.pedestrian_state_buffer.append((timestamp, pedestrians))
+        if (
+            len(self.pedestrian_state_buffer) > 1
+            and timestamp < self.pedestrian_state_buffer[-2][0]
+        ):
+            self.pedestrian_state_buffer = deque(
+                sorted(self.pedestrian_state_buffer, key=lambda sample: sample[0]),
+                maxlen=120,
+            )
 
     def get_robot_velocity_camera(self):
         # Odometry twist is at the base origin. Include the camera lever arm so
@@ -772,8 +827,9 @@ class SteeringNode(Node):
             if len(last_path) > 0:
                 obs_image = np.array(self.image_queue[-1])
                 image_timestamp = self.image_timestamp_queue[-1]
-                image_receipt_ros = self.image_receipt_ros_queue[-1]
-                image_receipt_steady = self.image_receipt_steady_queue[-1]
+                if image_timestamp == self.last_processed_image_timestamp:
+                    return
+                self.last_processed_image_timestamp = image_timestamp
                 current_base_pose_world = self.get_base_pose_world(image_timestamp)
                 vla_path = resample_path(last_path, num_waypoints=8)
 
@@ -793,6 +849,7 @@ class SteeringNode(Node):
                     t2 = time.perf_counter()
                     self.get_logger().info(f"=== >  depth + bbox inference took {(t2 - t0) * 1000:.1f} ms")
 
+                pos_dict = {}
                 if len(bbox_only) > 0:
                     candidate_boxes = np.asarray(bbox_only, dtype=np.float64).reshape(-1, 4)
                     keep_mask = individual_detection_mask(
@@ -806,7 +863,6 @@ class SteeringNode(Node):
                     )
                     detections = self.tracker.update_with_detections(sv_detection)
 
-                    pos_dict = {}
                     for box, id in zip(detections.xyxy, detections.tracker_id):
                         x1, y1, x2, y2 = box
                         box_width = x2 - x1
@@ -830,75 +886,26 @@ class SteeringNode(Node):
                         pos_dict[id] = median_3d
                     # coopting the data field since it is unused.
                     detections.data = pos_dict
-                    if self.debug_object_motion:
-                        current_track_ids = set()
-                        for box, track_id in zip(detections.xyxy, detections.tracker_id):
-                            track_id = int(track_id)
-                            current_track_ids.add(track_id)
-                            position = pos_dict.get(track_id)
-                            previous = self.motion_track_debug_history.get(track_id)
-                            if position is None:
-                                self.get_logger().info(
-                                    f"[track-debug] stamp={image_timestamp:.6f} "
-                                    f"track={track_id} box={np.asarray(box).tolist()} "
-                                    "position_cam=None"
-                                )
-                                continue
-                            if previous is None:
-                                change_text = "new_track=True"
-                            else:
-                                previous_stamp, previous_position = previous
-                                track_dt = image_timestamp - previous_stamp
-                                position_delta = position - previous_position
-                                raw_speed = (
-                                    np.linalg.norm(position_delta) / track_dt
-                                    if track_dt > 1e-6 else float("nan")
-                                )
-                                change_text = (
-                                    f"dt={track_dt:.3f} "
-                                    f"position_delta_cam={position_delta.tolist()} "
-                                    f"raw_speed={raw_speed:.3f}"
-                                )
-                            self.get_logger().info(
-                                f"[track-debug] stamp={image_timestamp:.6f} "
-                                f"track={track_id} box={np.asarray(box).tolist()} "
-                                f"position_cam={position.tolist()} {change_text}"
-                            )
-                            self.motion_track_debug_history[track_id] = (
-                                image_timestamp,
-                                position.copy(),
-                            )
-                        missing_track_ids = (
-                            self.motion_track_debug_active_ids - current_track_ids
-                        )
-                        if missing_track_ids:
-                            self.get_logger().info(
-                                f"[track-debug] stamp={image_timestamp:.6f} "
-                                f"missing_tracks={sorted(missing_track_ids)}"
-                            )
-                        self.motion_track_debug_active_ids = current_track_ids
                     # pred_color = plot_bbox(frame_rgb, bbox_result, detections.tracker_id, show_plot=False, return_img=True)
                 else:
                     # pred_color = frame_rgb
-                    detections = sv.Detections(xyxy=np.array([[0, 0, 0, 0]]), confidence=np.array([0.7]),
-                                               tracker_id=np.array([0]), data={})
-                    if self.debug_object_motion and self.motion_track_debug_active_ids:
-                        self.get_logger().info(
-                            f"[track-debug] stamp={image_timestamp:.6f} "
-                            f"missing_tracks={sorted(self.motion_track_debug_active_ids)}"
-                        )
-                        self.motion_track_debug_active_ids.clear()
+                    # Advance ByteTrack on misses so its Kalman state and lost
+                    # buffer stay synchronized with detector frames. Skipping
+                    # the update makes a reappearing pedestrian look as though
+                    # it moved several frames in one tracker step, which causes
+                    # unnecessary new IDs.
+                    detections = self.tracker.update_with_detections(
+                        sv.Detections.empty()
+                    )
+                    detections.data = {}
                 # detection queue
                 self.detection_queue.append(detections)
                 self.detection_timestamp_queue.append(image_timestamp)
-                self.detection_receipt_ros_queue.append(image_receipt_ros)
-                self.detection_receipt_steady_queue.append(image_receipt_steady)
                 base_pose_world = current_base_pose_world
                 camera_pose_world = (
                     None if base_pose_world is None
                     else base_pose_world @ self.T_base_from_cam
                 )
-                self.detection_base_pose_queue.append(base_pose_world)
                 self.detection_camera_pose_queue.append(camera_pose_world)
                 if len(self.detection_queue) > self.detection_queue_len:
                     self.detection_queue.pop(0)
@@ -907,116 +914,35 @@ class SteeringNode(Node):
                     self.get_logger().info(f"tracker update took {(t3 - t2) * 1000:.1f} ms")
                 robot_velocity_camera = self.get_robot_velocity_camera()
                 robot_angular_velocity_camera = self.get_robot_angular_velocity_camera()
-                if self.debug_object_motion:
-                    odom_age = (
-                        float("nan") if self.latest_odom_timestamp is None
-                        else image_timestamp - self.latest_odom_timestamp
+                external_velocities_camera = {}
+                if (
+                    self.object_velocity_source == "sim-ground-truth"
+                    and camera_pose_world is not None
+                    and pos_dict
+                ):
+                    snapshot = closest_pedestrian_snapshot(
+                        self.pedestrian_state_buffer,
+                        image_timestamp,
+                        max_age=self.pedestrian_state_max_age,
                     )
-                    self.get_logger().info(
-                        "[motion-debug] timing "
-                        f"image_stamp={image_timestamp:.6f} "
-                        f"latest_odom_stamp={self.latest_odom_timestamp} "
-                        f"image_minus_latest_odom={odom_age:.3f} "
-                        f"processing_lag_wall="
-                        f"{time.monotonic() - image_receipt_steady:.3f} "
-                        f"pose_aligned={camera_pose_world is not None}"
-                    )
-                    if len(self.detection_timestamp_queue) >= 2:
-                        t0, t1 = list(self.detection_timestamp_queue)[-2:]
-                        image_ros0, image_ros1 = list(
-                            self.detection_receipt_ros_queue
-                        )[-2:]
-                        image_steady0, image_steady1 = list(
-                            self.detection_receipt_steady_queue
-                        )[-2:]
-                        base0, base1 = list(self.detection_base_pose_queue)[-2:]
-                        _, cam1 = list(self.detection_camera_pose_queue)[-2:]
-                        twist0 = interpolate_vector_samples(
-                            self.odom_linear_velocity_buffer, t0
+                    if snapshot is not None:
+                        snapshot_timestamp, pedestrians_world = snapshot
+                        pedestrians_world = advance_pedestrian_states(
+                            pedestrians_world,
+                            image_timestamp - snapshot_timestamp,
                         )
-                        twist1 = interpolate_vector_samples(
-                            self.odom_linear_velocity_buffer, t1
+                        pedestrians_camera = pedestrian_states_in_camera(
+                            pedestrians_world, camera_pose_world
                         )
-                        angular0 = interpolate_vector_samples(
-                            self.odom_angular_velocity_buffer, t0
+                        matches = match_pedestrians_to_tracks(
+                            pos_dict,
+                            pedestrians_camera,
+                            max_ground_distance=self.pedestrian_match_distance,
                         )
-                        angular1 = interpolate_vector_samples(
-                            self.odom_angular_velocity_buffer, t1
-                        )
-                        odom_receipt0 = interpolate_vector_samples(
-                            self.odom_receipt_time_buffer, t0
-                        )
-                        odom_receipt1 = interpolate_vector_samples(
-                            self.odom_receipt_time_buffer, t1
-                        )
-                        if base0 is not None and base1 is not None and t1 > t0:
-                            dt_pose = t1 - t0
-                            image_receipt_ros_dt = image_ros1 - image_ros0
-                            image_receipt_steady_dt = image_steady1 - image_steady0
-                            odom_receipt_ros_dt = (
-                                None if odom_receipt0 is None or odom_receipt1 is None
-                                else odom_receipt1[0] - odom_receipt0[0]
-                            )
-                            odom_receipt_steady_dt = (
-                                None if odom_receipt0 is None or odom_receipt1 is None
-                                else odom_receipt1[1] - odom_receipt0[1]
-                            )
-                            image_header_over_steady = (
-                                None if image_receipt_steady_dt <= 1e-6
-                                else dt_pose / image_receipt_steady_dt
-                            )
-                            odom_header_over_steady = (
-                                None if odom_receipt_steady_dt is None
-                                or odom_receipt_steady_dt <= 1e-6
-                                else dt_pose / odom_receipt_steady_dt
-                            )
-                            base0_from_base1 = np.linalg.inv(base0) @ base1
-                            cam1_from_cam0 = np.linalg.inv(cam1) @ (
-                                base0 @ self.T_base_from_cam
-                            )
-                            pose_velocity_base = base0_from_base1[:3, 3] / dt_pose
-                            relative_rotation = (np.linalg.inv(base0) @ base1)[:3, :3]
-                            yaw_delta = yaw_from_rotation(relative_rotation)
-                            yaw_rate = yaw_delta / dt_pose
-                            mean_twist = (
-                                None if twist0 is None or twist1 is None
-                                else 0.5 * (twist0 + twist1)
-                            )
-                            mean_angular = (
-                                None if angular0 is None or angular1 is None
-                                else 0.5 * (angular0 + angular1)
-                            )
-                            pose_speed = np.linalg.norm(pose_velocity_base[:2])
-                            twist_speed = (
-                                None if mean_twist is None else
-                                np.linalg.norm(mean_twist[:2])
-                            )
-                            linear_scale = (
-                                None if twist_speed is None or pose_speed < 1e-6
-                                else twist_speed / pose_speed
-                            )
-                            angular_scale = (
-                                None if mean_angular is None or abs(yaw_rate) < 1e-6
-                                else abs(mean_angular[2] / yaw_rate)
-                            )
-                            self.get_logger().info(
-                                "[motion-debug] pose interval "
-                                f"t0={t0:.6f} t1={t1:.6f} dt={dt_pose:.3f} "
-                                f"image_receipt_ros_dt={image_receipt_ros_dt:.3f} "
-                                f"image_receipt_steady_dt={image_receipt_steady_dt:.3f} "
-                                f"image_header_over_steady={image_header_over_steady} "
-                                f"odom_receipt_ros_dt={odom_receipt_ros_dt} "
-                                f"odom_receipt_steady_dt={odom_receipt_steady_dt} "
-                                f"odom_header_over_steady={odom_header_over_steady} "
-                                f"translation_base={base0_from_base1[:3, 3].tolist()} "
-                                f"pose_velocity_base={pose_velocity_base.tolist()} "
-                                f"yaw_delta={yaw_delta:.6f} yaw_rate={yaw_rate:.6f} "
-                                f"mean_twist_base={None if mean_twist is None else mean_twist.tolist()} "
-                                f"mean_angular_base={None if mean_angular is None else mean_angular.tolist()} "
-                                f"linear_twist_over_pose={linear_scale} "
-                                f"angular_twist_over_pose={angular_scale} "
-                                f"earlier_origin_in_later_cam={cam1_from_cam0[:3, 3].tolist()}"
-                            )
+                        external_velocities_camera = {
+                            track_id: match["velocity_camera"]
+                            for track_id, match in matches.items()
+                        }
                 if self.no_velocity:
                     trajectory_points = points_input
                     point_movement_bev = []
@@ -1031,19 +957,19 @@ class SteeringNode(Node):
                         robot_angular_velocity_camera=robot_angular_velocity_camera,
                         detection_timestamps=self.detection_timestamp_queue,
                         camera_poses_world=self.detection_camera_pose_queue,
-                        last_n_records=2,
-                        # Roughly one second of observations smooths detector-box
-                        # and monocular-depth jitter without trusting one frame.
-                        velocity_window=9,
-                        min_dynamic_observations=3,
-                        min_velocity_interval=0.075,
+                        # Smooth the basic per-track estimate over at most five
+                        # recent position readings.
+                        velocity_window=5,
                         # Monocular depth varies slightly from frame to frame.
                         # A 0.1 m/s cutoff regularly turns that scale noise into
                         # motion on a stationary person while the robot drives.
                         min_dynamic_speed=0.25,
                         max_dynamic_speed=3.0,
                         time_look_ahead=self.time_look_ahead,
-                        debug_motion=self.debug_object_motion,
+                        external_velocities_camera=external_velocities_camera,
+                        allow_velocity_fallback=(
+                            self.object_velocity_source != "sim-ground-truth"
+                        ),
                     )
                     point_movement_bev = [
                         (
@@ -1081,7 +1007,6 @@ class SteeringNode(Node):
                     args, trajectory_points, estimated_cam_matrix, vla_path,
                     n_iter=20, time_session=False, fix_end=args.fix_end,
                     temporal_deformation=temporal_deformation,
-                    temporal_age=temporal_age,
                     dynamic_projection_mask=dynamic_projection_mask)
                 if self.show_time_performance:
                     t4 = time.perf_counter()
@@ -1091,24 +1016,6 @@ class SteeringNode(Node):
                     opt_path_xy,
                     target_distance=self.lookahead_distance,
                 )
-                if self.debug_waypoints:
-                    temporal_deformation_norms = (
-                        None if temporal_deformation is None
-                        else np.linalg.norm(temporal_deformation, axis=1).tolist()
-                    )
-                    temporal_lateral_deformation = (
-                        None if temporal_deformation is None
-                        else temporal_deformation[:, 1].tolist()
-                    )
-                    self.get_logger().info(
-                        "[waypoint-debug] selected waypoint "
-                        f"waypoint={chosen_waypoint.flatten().tolist()} "
-                        f"target_distance={self.lookahead_distance:.3f} "
-                        f"temporal_age={temporal_age} "
-                        f"carried_deformation_norms={temporal_deformation_norms} "
-                        f"carried_lateral_deformation={temporal_lateral_deformation}"
-                    )
-
                 if current_base_pose_world is not None:
                     self.previous_path_deformation = (
                         np.asarray(untruncated_path_xy, dtype=np.float64)
@@ -1210,14 +1117,36 @@ if __name__ == "__main__":
         help="Episode metadata topic used by sim_nova to reset steering state.",
     )
     parser.add_argument(
-        "--debug-motion",
-        action="store_true",
-        help="Log optimized paths, waypoint spacing, folds, and waypoint selection.",
+        "--object-velocity-source",
+        choices=("estimated", "sim-ground-truth"),
+        default="estimated",
+        help="Use visual velocity estimation or timestamped Isaac pedestrian state.",
     )
     parser.add_argument(
-        "--debug-object-motion",
-        action="store_true",
-        help="Log detection tracks, pose alignment, and object velocity estimates.",
+        "--pedestrian-state-topic",
+        default="/isaacsim/pedestrians",
+        help="Isaac pedestrian ground-truth JSON topic.",
+    )
+    parser.add_argument(
+        "--pedestrian-state-max-age",
+        type=float,
+        default=0.25,
+        help="Maximum timestamp difference for simulator pedestrian state.",
+    )
+    parser.add_argument(
+        "--pedestrian-match-distance",
+        type=float,
+        default=1.0,
+        help="Maximum camera X/Z distance for matching a track to simulator state.",
+    )
+    parser.add_argument(
+        "--odom-pose-max-extrapolation",
+        type=float,
+        default=0.25,
+        help=(
+            "Maximum seconds to extrapolate the newest odometry pose when an "
+            "image callback arrives before same-timestamp odometry."
+        ),
     )
     parser.add_argument(
         "--no-velocity",
@@ -1236,7 +1165,7 @@ if __name__ == "__main__":
         "--time-look-ahead",
         "--time_look_ahead",
         type=float,
-        default=1.0,
+        default=1.5,
         help="Obstacle-motion prediction lookahead in seconds.",
     )
     parser.add_argument("--h-min", type=float, default=0.5, help="Minimum kept height in meters.")

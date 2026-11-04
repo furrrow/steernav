@@ -84,7 +84,8 @@ uv run python inference/<model>_ros.py --robot sim_nova
 cd /home/jim/Projects/steernav
 source /opt/ros/humble/setup.bash
 export ROS_DOMAIN_ID=42
-uv run steernav/ros_inference.py --robot sim_nova
+uv run steernav/ros_inference.py --robot sim_nova \
+  --object-velocity-source sim-ground-truth
 
 # Terminal 4: SteerNav controller; --steer is required
 cd /home/jim/Projects/steernav
@@ -107,6 +108,7 @@ ros2 topic echo /isaacsim/episode std_msgs/msg/String \
   --qos-durability transient_local --once
 ros2 topic hz /isaacsim/camera/front/image_raw/compressed
 ros2 topic hz /isaacsim/odom
+ros2 topic echo /isaacsim/pedestrians std_msgs/msg/String --once
 ros2 topic echo /sim_nova/policy_path nav_msgs/msg/Path --once
 ros2 topic echo /sim_nova/steered_waypoint \
   std_msgs/msg/Float32MultiArray --once
@@ -134,6 +136,12 @@ ByteTrack tracks, compensates tracked motion with timestamp-aligned odometry,
 predicts obstacle motion, and calls `update_trajectories`. The optimized path is
 then reduced to the configured arc-length lookahead waypoint and published.
 
+For Isaac benchmarks, `--object-velocity-source sim-ground-truth` matches each
+detected person to the timestamped simulator position and uses its world-frame
+velocity after rotating it into camera axes. Simulator velocity is authoritative
+in this mode: if simulator state is stale or a track is unmatched, SteerNav
+retains the observed depth obstacle but suppresses its motion projection instead
+of falling back to a visual velocity estimate.
 `--no-velocity` skips Florence-2, tracking, and velocity adjustment, passing the
 original depth points directly to `update_trajectories`. `--debug-motion` reports
 the optimized path, segment lengths, turn cosines, temporal prior, and selected

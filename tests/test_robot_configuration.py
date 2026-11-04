@@ -27,15 +27,53 @@ def load_ros_inference_functions(*names):
 
 (
     transform_robot_twist_to_camera,
-    interpolate_vector_samples,
-    yaw_from_rotation,
+    quaternion_to_rotation_matrix,
+    rotation_vector_to_matrix,
+    interpolate_pose_samples,
+    pose_at_timestamp,
     individual_detection_mask,
 ) = load_ros_inference_functions(
     "transform_robot_twist_to_camera",
-    "interpolate_vector_samples",
-    "yaw_from_rotation",
+    "quaternion_to_rotation_matrix",
+    "rotation_vector_to_matrix",
+    "interpolate_pose_samples",
+    "pose_at_timestamp",
     "individual_detection_mask",
 )
+
+
+def test_pose_at_timestamp_extrapolates_trailing_odometry_in_body_frame():
+    half_yaw = np.pi / 4.0
+    samples = [(
+        10.0,
+        np.array([1.0, 2.0, 0.0]),
+        np.array([0.0, 0.0, np.sin(half_yaw), np.cos(half_yaw)]),
+    )]
+
+    pose = pose_at_timestamp(
+        samples,
+        [(10.0, np.array([2.0, 0.0, 0.0]))],
+        [(10.0, np.zeros(3))],
+        10.1,
+        max_extrapolation=0.25,
+    )
+
+    np.testing.assert_allclose(pose[:3, 3], [1.0, 2.2, 0.0], atol=1e-7)
+    np.testing.assert_allclose(
+        pose[:3, :3], quaternion_to_rotation_matrix(samples[0][2]), atol=1e-7
+    )
+
+
+def test_pose_at_timestamp_rejects_extrapolation_past_limit():
+    samples = [(10.0, np.zeros(3), np.array([0.0, 0.0, 0.0, 1.0]))]
+
+    assert pose_at_timestamp(
+        samples,
+        [(10.0, np.zeros(3))],
+        [(10.0, np.zeros(3))],
+        10.3,
+        max_extrapolation=0.25,
+    ) is None
 
 
 def test_husky_has_complete_runtime_configuration():
@@ -86,29 +124,6 @@ def test_camera_lever_arm_is_included_for_nonvertical_offset():
     )
 
     np.testing.assert_allclose(linear_camera, [0.0, 0.5, 0.0])
-
-
-def test_vector_samples_are_interpolated_at_image_timestamp():
-    samples = [
-        (10.0, np.array([0.2, 0.0, 0.0])),
-        (11.0, np.array([0.6, 0.0, 0.0])),
-    ]
-
-    interpolated = interpolate_vector_samples(samples, 10.25)
-
-    np.testing.assert_allclose(interpolated, [0.3, 0.0, 0.0])
-    assert interpolate_vector_samples(samples, 9.8) is None
-
-
-def test_yaw_from_rotation_reports_planar_heading_change():
-    angle = 0.4
-    rotation = np.array([
-        [np.cos(angle), -np.sin(angle), 0.0],
-        [np.sin(angle), np.cos(angle), 0.0],
-        [0.0, 0.0, 1.0],
-    ])
-
-    np.testing.assert_allclose(yaw_from_rotation(rotation), angle)
 
 
 def test_individual_detection_mask_removes_group_box():
