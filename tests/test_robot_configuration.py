@@ -4,6 +4,8 @@ from pathlib import Path
 import numpy as np
 import yaml
 
+from steernav.geometry import transform_robot_twist_to_camera
+
 
 ROOT = Path(__file__).resolve().parents[1]
 ROS_INFERENCE_PATH = ROOT / "steernav" / "ros_inference.py"
@@ -25,11 +27,7 @@ def load_ros_inference_functions(*names):
     return tuple(namespace[name] for name in names)
 
 
-(
-    transform_robot_twist_to_camera,
-    individual_detection_mask,
-) = load_ros_inference_functions(
-    "transform_robot_twist_to_camera",
+(individual_detection_mask,) = load_ros_inference_functions(
     "individual_detection_mask",
 )
 

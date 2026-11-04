@@ -1,27 +1,6 @@
-import ast
-from pathlib import Path
-
 import numpy as np
 
-
-def load_path_function(name):
-    source_path = Path(__file__).resolve().parents[1] / "steernav" / "ros_inference.py"
-    tree = ast.parse(source_path.read_text())
-    function_node = next(
-        node
-        for node in tree.body
-        if isinstance(node, ast.FunctionDef)
-        and node.name == name
-    )
-    module = ast.Module(body=[function_node], type_ignores=[])
-    ast.fix_missing_locations(module)
-    namespace = {"np": np}
-    exec(compile(module, str(source_path), "exec"), namespace)
-    return namespace[name]
-
-
-resample_path = load_path_function("resample_path")
-pick_waypoint = load_path_function("pick_waypoint")
+from steernav.geometry import pick_waypoint, resample_path
 
 
 def test_interpolates_when_first_waypoint_is_too_far():

@@ -3,25 +3,9 @@ from pathlib import Path
 
 import numpy as np
 
+from steernav.geometry import rotate_path_deformation_between_base_frames
 
-def load_ros_inference_function(name):
-    source_path = Path(__file__).resolve().parents[1] / "steernav" / "ros_inference.py"
-    tree = ast.parse(source_path.read_text())
-    function_node = next(
-        node
-        for node in tree.body
-        if isinstance(node, ast.FunctionDef) and node.name == name
-    )
-    module = ast.Module(body=[function_node], type_ignores=[])
-    ast.fix_missing_locations(module)
-    namespace = {"np": np}
-    exec(compile(module, str(source_path), "exec"), namespace)
-    return namespace[name]
-
-
-rotate_deformation = load_ros_inference_function(
-    "rotate_path_deformation_between_base_frames"
-)
+rotate_deformation = rotate_path_deformation_between_base_frames
 def load_steering_function(name):
     source_path = Path(__file__).resolve().parents[1] / "steernav" / "steer_dummy_path.py"
     tree = ast.parse(source_path.read_text())
