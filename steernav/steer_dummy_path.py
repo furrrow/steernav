@@ -30,6 +30,9 @@ from custom_utils.io_utils import load_calibration, filter_unwanted_results
 from custom_utils.pointcloud_utils import camera_to_base_transform, pointcloud_to_esdf_pipeline, update_points
 
 
+SAFETY_CLEARANCE_MARGIN_M = 0.5
+
+
 @dataclass
 class BoxRecord:
     x1: float
@@ -593,14 +596,9 @@ def constrain_path_to_clearance_prefix(
     return path
 
 
-def safety_clearance_margin(
-        robot_radius: float,
-) -> float:
-    """Require one robot radius of clearance beyond the inflated footprint."""
-    robot_radius = float(robot_radius)
-    if not np.isfinite(robot_radius) or robot_radius < 0.0:
-        raise ValueError("robot_radius must be finite and nonnegative")
-    return robot_radius
+def safety_clearance_margin() -> float:
+    """Return the fixed clearance required beyond the inflated footprint."""
+    return SAFETY_CLEARANCE_MARGIN_M
 
 def adam_update_numpy(
         path_xy: np.ndarray,
@@ -732,7 +730,7 @@ def adam_update_numpy(
         args,
         grid_cell_centers=True,
     )
-    minimum_clearance = safety_clearance_margin(args.robot_radius)
+    minimum_clearance = safety_clearance_margin()
     untruncated_path = path.copy()
     safe_path = constrain_path_to_clearance_prefix(
         untruncated_path,
@@ -802,7 +800,7 @@ def update_trajectories(args: Namespace,
         )
         temporal_point_weights = temporal_clearance_weights(
             temporal_clearance,
-            safety_clearance_margin(args.robot_radius),
+            safety_clearance_margin(),
         )
     # Optimize path using ESDF gradients
     # numpy version, n_iter=5, 1.3ms

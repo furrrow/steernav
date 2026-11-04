@@ -12,7 +12,17 @@ def load_path_function(name):
         for node in tree.body
         if isinstance(node, ast.FunctionDef) and node.name == name
     )
-    module = ast.Module(body=[function_node], type_ignores=[])
+    constants = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name)
+            and target.id == "SAFETY_CLEARANCE_MARGIN_M"
+            for target in node.targets
+        )
+    ]
+    module = ast.Module(body=[*constants, function_node], type_ignores=[])
     ast.fix_missing_locations(module)
     namespace = {"np": np}
     exec(compile(module, str(source_path), "exec"), namespace)
@@ -51,17 +61,21 @@ def test_nonpositive_first_clearance_commands_stop():
     np.testing.assert_array_equal(result, np.zeros_like(path))
 
 
-def test_radius_dependent_margin_blocks_small_positive_clearance():
+def test_fixed_margin_blocks_small_positive_clearance():
     path = np.array([[0.3, 0.0], [0.6, 0.1], [0.9, 0.2]])
     clearance = np.array([0.6, 0.12, 0.7])
 
     result = constrain_path_to_clearance_prefix(
         path,
         clearance,
-        minimum_clearance=safety_clearance_margin(0.5),
+        minimum_clearance=safety_clearance_margin(),
     )
 
     np.testing.assert_allclose(
         result,
         [[0.3, 0.0], [0.3, 0.0], [0.3, 0.0]],
     )
+
+
+def test_safety_clearance_margin_is_fixed_at_half_a_meter():
+    assert safety_clearance_margin() == 0.5
