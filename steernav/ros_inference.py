@@ -390,7 +390,6 @@ class SteeringNode(Node):
         self.path_frame_id = "base_link"
         self._started_sent = False
         self.show_time_performance = False
-        self.debug_waypoints = args.debug_motion
         self.debug_object_motion = bool(
             getattr(args, "debug_object_motion", False)
         )
@@ -1081,7 +1080,6 @@ class SteeringNode(Node):
                     args, trajectory_points, estimated_cam_matrix, vla_path,
                     n_iter=20, time_session=False, fix_end=args.fix_end,
                     temporal_deformation=temporal_deformation,
-                    temporal_age=temporal_age,
                     dynamic_projection_mask=dynamic_projection_mask)
                 if self.show_time_performance:
                     t4 = time.perf_counter()
@@ -1091,24 +1089,6 @@ class SteeringNode(Node):
                     opt_path_xy,
                     target_distance=self.lookahead_distance,
                 )
-                if self.debug_waypoints:
-                    temporal_deformation_norms = (
-                        None if temporal_deformation is None
-                        else np.linalg.norm(temporal_deformation, axis=1).tolist()
-                    )
-                    temporal_lateral_deformation = (
-                        None if temporal_deformation is None
-                        else temporal_deformation[:, 1].tolist()
-                    )
-                    self.get_logger().info(
-                        "[waypoint-debug] selected waypoint "
-                        f"waypoint={chosen_waypoint.flatten().tolist()} "
-                        f"target_distance={self.lookahead_distance:.3f} "
-                        f"temporal_age={temporal_age} "
-                        f"carried_deformation_norms={temporal_deformation_norms} "
-                        f"carried_lateral_deformation={temporal_lateral_deformation}"
-                    )
-
                 if current_base_pose_world is not None:
                     self.previous_path_deformation = (
                         np.asarray(untruncated_path_xy, dtype=np.float64)
@@ -1208,11 +1188,6 @@ if __name__ == "__main__":
         "--episode-topic",
         default="/isaacsim/episode",
         help="Episode metadata topic used by sim_nova to reset steering state.",
-    )
-    parser.add_argument(
-        "--debug-motion",
-        action="store_true",
-        help="Log optimized paths, waypoint spacing, folds, and waypoint selection.",
     )
     parser.add_argument(
         "--debug-object-motion",

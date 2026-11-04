@@ -17,7 +17,7 @@ from transformers import AutoProcessor, AutoModelForCausalLM
 import matplotlib
 # Respect the backend selected by the importing application. ros_inference
 # selects Agg so it can run on a headless robot.
-from scipy.ndimage import zoom, gaussian_filter, distance_transform_edt
+from scipy.ndimage import zoom, gaussian_filter
 from scipy.spatial import cKDTree
 from moge.model.v2 import MoGeModel
 import supervision as sv
@@ -322,67 +322,6 @@ def sample_bev_map(
     )
 
 
-def blocked_waypoint_diagnostics(
-        path_xy: np.ndarray,
-        z_scaled: np.ndarray,
-        safety_clearance: np.ndarray,
-        blocked_indices: np.ndarray,
-        esdf_result: dict,
-        smoothed_clearance: np.ndarray,
-        args: Namespace,
-) -> list[dict]:
-    """Describe the ESDF evidence at each blocked optimized waypoint."""
-    if len(blocked_indices) == 0:
-        return []
-
-    occupied = np.asarray(esdf_result["occupied_mask"], dtype=bool)
-    visible_free = np.asarray(esdf_result["visible_free_mask"], dtype=bool)
-    unknown = np.asarray(esdf_result["unknown_mask"], dtype=bool)
-    dynamic = np.asarray(esdf_result["dynamic_occupied_mask"], dtype=bool)
-    invalid = occupied | unknown
-    _distance, nearest_invalid = distance_transform_edt(
-        ~invalid, return_indices=True
-    )
-    native_samples = sample_bev_map(
-        path_xy, esdf_result["clearance"], args, grid_cell_centers=True
-    )
-    smoothed_samples = sample_bev_map(path_xy, smoothed_clearance, args)
-
-    rows, cols = occupied.shape
-    col = np.clip(
-        np.floor((path_xy[:, 0] - args.x_min) / args.resolution).astype(np.int32),
-        0, cols - 1,
-    )
-    row = np.clip(
-        np.floor((path_xy[:, 1] - args.y_min) / args.resolution).astype(np.int32),
-        0, rows - 1,
-    )
-    diagnostics = []
-    for index in blocked_indices:
-        r, c = int(row[index]), int(col[index])
-        nearest_r = int(nearest_invalid[0, r, c])
-        nearest_c = int(nearest_invalid[1, r, c])
-        classification = (
-            "occupied" if occupied[r, c]
-            else "visible_free" if visible_free[r, c]
-            else "unknown"
-        )
-        diagnostics.append({
-            "index": int(index),
-            "xy": path_xy[index].tolist(),
-            "z_scaled": float(z_scaled[index]),
-            "safety_clearance": float(safety_clearance[index]),
-            "native_clearance": float(native_samples[index]),
-            "smoothed_clearance": float(smoothed_samples[index]),
-            "classification": classification,
-            "dynamic_projected_at_cell": bool(dynamic[r, c]),
-            "nearest_invalid_classification": (
-                "occupied" if occupied[nearest_r, nearest_c] else "unknown"
-            ),
-            "nearest_invalid_dynamic_projection": bool(dynamic[nearest_r, nearest_c]),
-        })
-    return diagnostics
-
 def get_path_update_scale(
     path: np.ndarray,
     min_scale: float = 0.1,
@@ -678,16 +617,12 @@ def adam_update_numpy(
         fix_end: bool = False,
         truncation_distance: float = 0.75,
         truncation_power: float = 2.0,
-        blocked_threshold: float = 0.03,
-        debug_motion: bool = False,
         max_segment_length: float | None = None,
         temporal_reference: np.ndarray | None = None,
         temporal_point_weights: np.ndarray | None = None,
-        temporal_age: float | None = None,
         min_turn_cosine: float = 0.5,
         min_update_scale: float = 0.2,
         esdf_result: dict | None = None,
-        smoothed_clearance: np.ndarray | None = None,
         args: Namespace | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
@@ -785,10 +720,8 @@ def adam_update_numpy(
         path = constrain_path_forward_progress(path, preserve_end=fix_end)
         path = constrain_xy_to_esdf(path, valid_mesh)
 
-    # z_scaled shapes the optimization surface, but its free-space compression
-    # and frame-dependent offset mean it is not a metric safety value. Apply
-    # the final feasible-prefix gate to native clearance in metres instead.
-    z_scaled, _, _ = sample_mesh_z_and_gradient(path, valid_mesh, esdf_height_scale)
+    # The optimization surface is compressed and frame-dependent, so apply the
+    # final feasible-prefix gate to native clearance in metres instead.
     if esdf_result is None or args is None:
         raise ValueError(
             "esdf_result and args are required for metric path feasibility"
@@ -800,64 +733,6 @@ def adam_update_numpy(
         grid_cell_centers=True,
     )
     minimum_clearance = safety_clearance_margin(args.robot_radius)
-    safety_blocked_indices = np.flatnonzero(
-        safety_clearance <= minimum_clearance
-    )
-    surface_blocked_indices = np.flatnonzero(z_scaled > blocked_threshold)
-    if debug_motion:
-        segment_vectors = np.diff(path, axis=0)
-        segment_lengths = np.linalg.norm(segment_vectors, axis=1)
-        turn_denominators = segment_lengths[:-1] * segment_lengths[1:]
-        turn_cosines = np.divide(
-            np.sum(segment_vectors[:-1] * segment_vectors[1:], axis=1),
-            turn_denominators,
-            out=np.full_like(turn_denominators, np.nan),
-            where=turn_denominators > eps,
-        )
-        reversal_indices = (np.flatnonzero(turn_cosines < 0.0) + 1).tolist()
-        backward_segment_indices = np.flatnonzero(segment_vectors[:, 0] < -eps).tolist()
-        temporal_offset = (
-            None if temporal_reference is None
-            else temporal_reference - np.asarray(path_xy, dtype=np.float64)
-        )
-        print(
-            "[waypoint-debug] optimized path "
-            f"input_path_xy={np.asarray(path_xy).tolist()} "
-            f"optimized_path_xy={path.tolist()} "
-            f"segment_lengths={segment_lengths.tolist()} "
-            f"max_segment_length={max_segment_length} "
-            f"turn_weight={turn_weight} "
-            f"min_turn_cosine={min_turn_cosine} "
-            f"min_update_scale={min_update_scale} "
-            f"final_update_scales="
-            f"{get_path_update_scale(path, min_scale=min_update_scale, max_scale=1.0, power=1.5).ravel().tolist()} "
-            f"temporal_age={temporal_age} "
-            f"temporal_reference={None if temporal_reference is None else temporal_reference.tolist()} "
-            f"temporal_point_weights={None if temporal_point_weights is None else temporal_point_weights.tolist()} "
-            f"temporal_offset={None if temporal_offset is None else temporal_offset.tolist()} "
-            f"turn_cosines={turn_cosines.tolist()} "
-            f"reversal_waypoint_indices={reversal_indices} "
-            f"forward_deltas={segment_vectors[:, 0].tolist()} "
-            f"backward_segment_indices={backward_segment_indices} "
-            f"z_scaled={z_scaled.tolist()} "
-            f"surface_blocked_threshold={blocked_threshold} "
-            f"surface_blocked_indices={surface_blocked_indices.tolist()} "
-            f"safety_clearance={safety_clearance.tolist()} "
-            f"robot_radius={args.robot_radius} "
-            f"minimum_clearance={minimum_clearance} "
-            f"safety_blocked_indices={safety_blocked_indices.tolist()} "
-            f"first_blocked_idx="
-            f"{None if len(safety_blocked_indices) == 0 else int(safety_blocked_indices[0])}"
-        )
-        if (
-            len(safety_blocked_indices) > 0
-            and smoothed_clearance is not None
-        ):
-            print(
-                "[waypoint-debug] blocked waypoint ESDF "
-                f"diagnostics={blocked_waypoint_diagnostics(path, z_scaled, safety_clearance, safety_blocked_indices, esdf_result, smoothed_clearance, args)}",
-                flush=True,
-            )
     untruncated_path = path.copy()
     safe_path = constrain_path_to_clearance_prefix(
         untruncated_path,
@@ -883,7 +758,6 @@ def update_trajectories(args: Namespace,
                         smooth_weight: float = 0.2,
                         fix_end: bool = False,
                         temporal_deformation: ndarray | None = None,
-                        temporal_age: float | None = None,
                         dynamic_projection_mask: ndarray | None = None,
                         ) -> tuple[
     dict[str, Tensor], ndarray, ndarray]:
@@ -930,13 +804,6 @@ def update_trajectories(args: Namespace,
             temporal_clearance,
             safety_clearance_margin(args.robot_radius),
         )
-        if bool(getattr(args, "debug_motion", False)):
-            print(
-                "[waypoint-debug] temporal gate "
-                f"deformation={temporal_deformation.tolist()} "
-                f"reference_clearance={temporal_clearance.tolist()} "
-                f"point_weights={temporal_point_weights.tolist()}"
-            )
     # Optimize path using ESDF gradients
     # numpy version, n_iter=5, 1.3ms
     opt_path_xy, untruncated_path_xy = adam_update_numpy(path_xy=init_path_xy, valid_mesh=valid_mesh,
@@ -947,12 +814,9 @@ def update_trajectories(args: Namespace,
                                     max_segment_length=max_segment_length,
                                     temporal_reference=temporal_reference,
                                     temporal_point_weights=temporal_point_weights,
-                                    temporal_age=temporal_age,
                                     min_update_scale=0.2,
                                     esdf_result=esdf_result,
-                                    smoothed_clearance=mesh.esdf,
-                                    args=args,
-                                    debug_motion=bool(getattr(args, "debug_motion", False)))
+                                    args=args)
     if time_session:
         t3 = time.perf_counter()
         print(f"constrain path, adam_update_numpy {(t3 - t2) * 1000:.1f} ms")
