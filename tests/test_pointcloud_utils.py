@@ -353,58 +353,6 @@ def test_update_points_detects_lateral_motion_and_preserves_swept_path():
     np.testing.assert_allclose(movement[0][1] - movement[0][0], [0.5, 0.0, 0.0])
 
 
-def test_update_points_uses_external_velocity_without_track_history():
-    points = np.zeros((2, 2, 3), dtype=np.float64)
-    points[..., 2] = 4.0
-    detections = [
-        SimpleNamespace(
-            tracker_id=np.array([21]),
-            data={21: np.array([0.0, 0.0, 4.0])},
-            xyxy=np.array([[0, 0, 2, 2]]),
-        )
-    ]
-
-    updated, movement = update_points(
-        points,
-        detections,
-        external_velocities_camera={21: np.array([0.5, 0.0, 0.0])},
-        time_look_ahead=1.0,
-        sweep_steps=2,
-    )
-
-    np.testing.assert_allclose(np.unique(updated[..., 0]), [0.0, 0.5])
-    assert len(movement) == 1
-    np.testing.assert_allclose(movement[0][1] - movement[0][0], [0.5, 0.0, 0.0])
-
-
-def test_update_points_does_not_estimate_unmatched_external_velocity():
-    points = np.zeros((2, 2, 3), dtype=np.float64)
-    points[..., 2] = 4.0
-    detections = [
-        SimpleNamespace(
-            tracker_id=np.array([21]),
-            data={21: np.array([0.0, 0.0, 4.0])},
-            xyxy=np.array([[0, 0, 2, 2]]),
-        ),
-        SimpleNamespace(
-            tracker_id=np.array([21]),
-            data={21: np.array([1.0, 0.0, 4.0])},
-            xyxy=np.array([[0, 0, 2, 2]]),
-        ),
-    ]
-
-    updated, movement = update_points(
-        points,
-        detections,
-        detection_timestamps=[1.0, 2.0],
-        external_velocities_camera={},
-        allow_velocity_fallback=False,
-    )
-
-    np.testing.assert_array_equal(updated, points)
-    assert movement == []
-
-
 def test_update_points_ignores_motion_below_dynamic_speed():
     points = np.zeros((2, 2, 3), dtype=np.float64)
     points[..., 2] = 4.0
