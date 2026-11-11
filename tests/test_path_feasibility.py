@@ -51,14 +51,14 @@ def test_nonpositive_first_clearance_commands_stop():
     np.testing.assert_array_equal(result, np.zeros_like(path))
 
 
-def test_radius_dependent_margin_blocks_small_positive_clearance():
+def test_fixed_margin_blocks_small_positive_clearance():
     path = np.array([[0.3, 0.0], [0.6, 0.1], [0.9, 0.2]])
     clearance = np.array([0.6, 0.12, 0.7])
 
     result = constrain_path_to_clearance_prefix(
         path,
         clearance,
-        minimum_clearance=safety_clearance_margin(0.5),
+        minimum_clearance=safety_clearance_margin(),
     )
 
     np.testing.assert_allclose(

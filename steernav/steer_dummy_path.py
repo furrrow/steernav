@@ -654,14 +654,9 @@ def constrain_path_to_clearance_prefix(
     return path
 
 
-def safety_clearance_margin(
-        robot_radius: float,
-) -> float:
-    """Require one robot radius of clearance beyond the inflated footprint."""
-    robot_radius = float(robot_radius)
-    if not np.isfinite(robot_radius) or robot_radius < 0.0:
-        raise ValueError("robot_radius must be finite and nonnegative")
-    return robot_radius
+def safety_clearance_margin() -> float:
+    """Require a fixed half-metre clearance beyond the inflated footprint."""
+    return 0.5
 
 def adam_update_numpy(
         path_xy: np.ndarray,
@@ -799,7 +794,7 @@ def adam_update_numpy(
         args,
         grid_cell_centers=True,
     )
-    minimum_clearance = safety_clearance_margin(args.robot_radius)
+    minimum_clearance = safety_clearance_margin()
     safety_blocked_indices = np.flatnonzero(
         safety_clearance <= minimum_clearance
     )
@@ -928,7 +923,7 @@ def update_trajectories(args: Namespace,
         )
         temporal_point_weights = temporal_clearance_weights(
             temporal_clearance,
-            safety_clearance_margin(args.robot_radius),
+            safety_clearance_margin(),
         )
         if bool(getattr(args, "debug_motion", False)):
             print(
