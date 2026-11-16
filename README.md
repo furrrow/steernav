@@ -9,6 +9,19 @@ The main ROS entry point is [`steernav/ros_inference.py`](steernav/ros_inference
 Despite its current name, this node does not run the VLA. The VLA is a separate
 process and supplies the nominal path that SteerNav modifies.
 
+## Branch status
+
+`sim-ground-truth` is the primary, most up-to-date development branch. Use it
+for new work and benchmark runs. Despite its name, it supports both visually
+estimated object velocities (`--object-velocity-source estimated`) and simulator
+ground-truth velocities (`--object-velocity-source sim-ground-truth`); using this
+branch does not require simulator velocities.
+
+`momentum` is deprecated and retained for historical reference and reproducing
+older experiments. New fixes and development should target `sim-ground-truth`.
+Record the branch, commit, velocity source, robot radius, and safety margin when
+comparing benchmark runs, since these settings have differed across versions.
+
 ## TIC-VLA / DynaNav workflow
 
 DynaNav's `ticvla_ros` navigation method is the simulator-side ROS bridge. It

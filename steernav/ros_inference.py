@@ -421,6 +421,9 @@ class SteeringNode(Node):
         self.previous_path_deformation = None
         self.previous_path_pose_world = None
         self.previous_path_timestamp = None
+        self.velocity_window = getattr(args, "velocity_window", 5)
+        self.odom_alignment = getattr(args, "odom_alignment", "extrapolate")
+        self.process_repeated_images = getattr(args, "process_repeated_images", False)
         self.object_velocity_source = getattr(args, "object_velocity_source", "estimated")
         self.pedestrian_state_buffer = deque(maxlen=120)
         self.pedestrian_state_max_age = float(getattr(args, "pedestrian_state_max_age", 0.1))
@@ -515,7 +518,7 @@ class SteeringNode(Node):
             msg_type, IMAGE_TOPIC, self.img_callback_obs,
             qos_profile=QoSProfile(reliability=QoSReliabilityPolicy.BEST_EFFORT,
                                    history=QoSHistoryPolicy.KEEP_LAST,
-                                   depth=1))
+                                   depth=getattr(args, "image_queue_depth", 1)))
         self.odom_sub = self.create_subscription(
             Odometry, ODOM_TOPIC, self.odom_callback_obs,
             qos_profile=QoSProfile(reliability=QoSReliabilityPolicy.BEST_EFFORT,
@@ -665,6 +668,10 @@ class SteeringNode(Node):
 
     def get_base_pose_world(self, timestamp):
         try:
+            if self.odom_alignment == "endpoint":
+                return interpolate_pose_samples(
+                    self.odom_pose_buffer, timestamp, max_endpoint_gap=0.1
+                )
             return pose_at_timestamp(
                 self.odom_pose_buffer,
                 self.odom_linear_velocity_buffer,
@@ -827,7 +834,8 @@ class SteeringNode(Node):
             if len(last_path) > 0:
                 obs_image = np.array(self.image_queue[-1])
                 image_timestamp = self.image_timestamp_queue[-1]
-                if image_timestamp == self.last_processed_image_timestamp:
+                if (not self.process_repeated_images
+                        and image_timestamp == self.last_processed_image_timestamp):
                     return
                 self.last_processed_image_timestamp = image_timestamp
                 current_base_pose_world = self.get_base_pose_world(image_timestamp)
@@ -957,9 +965,8 @@ class SteeringNode(Node):
                         robot_angular_velocity_camera=robot_angular_velocity_camera,
                         detection_timestamps=self.detection_timestamp_queue,
                         camera_poses_world=self.detection_camera_pose_queue,
-                        # Smooth the basic per-track estimate over at most five
-                        # recent position readings.
-                        velocity_window=5,
+                        # Number of recent observations in the visual velocity fit.
+                        velocity_window=self.velocity_window,
                         # Monocular depth varies slightly from frame to frame.
                         # A 0.1 m/s cutoff regularly turns that scale noise into
                         # motion on a stationary person while the robot drives.
@@ -1168,6 +1175,23 @@ if __name__ == "__main__":
         default=1.5,
         help="Obstacle-motion prediction lookahead in seconds.",
     )
+    parser.add_argument(
+        "--velocity-window", type=int, default=5,
+        help="Maximum recent observations in the visual velocity fit (at least 3).",
+    )
+    parser.add_argument(
+        "--odom-alignment", choices=("extrapolate", "endpoint"),
+        default="extrapolate",
+        help="Current bounded extrapolation or crossover endpoint reuse within 0.1 s.",
+    )
+    parser.add_argument(
+        "--image-queue-depth", type=int, default=1,
+        help="ROS image subscription KEEP_LAST depth (at least 1).",
+    )
+    parser.add_argument(
+        "--process-repeated-images", action="store_true",
+        help="Allow repeated processing of the same image timestamp, as in crossover.",
+    )
     parser.add_argument("--h-min", type=float, default=0.5, help="Minimum kept height in meters.")
     parser.add_argument("--h-max", type=float, default=1.5, help="Maximum kept height in meters.")
     parser.add_argument("--x-min", type=float, default=0.0, help="Minimum forward extent in meters.")
@@ -1187,4 +1211,10 @@ if __name__ == "__main__":
     args, ros_args = parser.parse_known_args()
     if ros_args and ros_args[0] != "--ros-args":
         parser.error(f"Unrecognized arguments: {ros_args}")
+    if args.velocity_window < 3 or args.velocity_window > 20:
+        parser.error("--velocity-window must be between 3 and 20")
+    if args.image_queue_depth < 1:
+        parser.error("--image-queue-depth must be at least 1")
+    if not np.isfinite(args.time_look_ahead) or args.time_look_ahead < 0:
+        parser.error("--time-look-ahead must be finite and nonnegative")
     main(args, ros_args)
