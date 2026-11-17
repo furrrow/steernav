@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 from custom_utils.pointcloud_utils import (
     _find_min_bin_hits,
+    _sweep_point_patch,
     compensate_camera_motion,
     pointcloud_to_esdf_pipeline,
     raytrace_visibility_from_points,
@@ -505,3 +506,47 @@ def test_update_points_rejects_implausibly_fast_tracking_jump():
 
     np.testing.assert_array_equal(updated, points)
     assert movement == []
+
+
+def test_sweep_tapers_width_in_direction_of_motion():
+    for displacement in ([0., 0., -2.], [2., 0., 0.], [1., 0., -1.]):
+        shift = np.array(displacement)
+        transverse = np.array([shift[2], 0., -shift[0]]) / np.linalg.norm(shift)
+        centre = np.array([2., 1., 4.])
+        points = np.array([centre - transverse] * 3 + [centre + transverse] * 3)
+        points[:, 1] = np.arange(6)
+        original = points.copy()
+        result = _sweep_point_patch(points, shift, num_steps=3, taper=True)
+        fractions = np.tile([0., .5, 1.], 2)
+        offsets = (result - centre - fractions[:, None] * shift) @ transverse
+        np.testing.assert_allclose(offsets, [-1., -.5, 0., 1., .5, 0.], atol=1e-12)
+        np.testing.assert_array_equal(result[:, 1], original[:, 1])
+        np.testing.assert_array_equal(points, original)
+        np.testing.assert_allclose(result[[0, 3]], original[[0, 3]])
+
+
+def test_sweep_stationary_and_invalid_points_are_unchanged():
+    points = np.array([[1., 2., 3.], [np.nan, 0., 1.], [2., 3., 4.]])
+    np.testing.assert_equal(_sweep_point_patch(points, np.zeros(3)), points)
+    result = _sweep_point_patch(points, np.array([0., 0., -1.]))
+    np.testing.assert_equal(result[1], points[1])
+
+
+def test_sweep_defaults_to_original_full_width_translation():
+    points = np.array([[-1., 0., 4.]] * 3 + [[1., 0., 4.]] * 3)
+    shift = np.array([0., 0., -2.])
+    fractions = np.tile([0., .5, 1.], 2)
+    result = _sweep_point_patch(points, shift, num_steps=3)
+    np.testing.assert_allclose(result, points + fractions[:, None] * shift)
+
+
+def test_external_velocity_sweep_taper_is_opt_in():
+    points = np.array([[[-1., 0., 4.]] * 3, [[1., 0., 4.]] * 3])
+    detection = SimpleNamespace(tracker_id=np.array([21]), data={},
+                                xyxy=np.array([[0, 0, 3, 2]]))
+    kwargs = dict(external_velocities_camera={21: np.array([0., 0., -1.])},
+                  time_look_ahead=1., sweep_steps=3)
+    baseline, _ = update_points(points.copy(), [detection], **kwargs)
+    tapered, _ = update_points(points.copy(), [detection], taper=True, **kwargs)
+    np.testing.assert_allclose(baseline[..., 0], points[..., 0])
+    np.testing.assert_allclose(tapered[..., 0], [[-1., -.5, 0.], [1., .5, 0.]])

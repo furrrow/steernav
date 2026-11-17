@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from collections import deque
 import json
+import os
+import signal
+from receiver_timing import ReceiverTiming, alignment_details
 import matplotlib
 matplotlib.use("Agg")
 
@@ -381,6 +384,10 @@ class SteeringNode(Node):
     def __init__(self, args: argparse.Namespace):
         super().__init__('Steering_Node')
 
+        self.velocity_reference_log = bool(getattr(args, "velocity_reference_log", False))
+        if self.velocity_reference_log and not getattr(args, "receiver_timing_log", None):
+            raise ValueError("--velocity-reference-log requires --receiver-timing-log")
+        self.receiver_timing = None
         self.buffer_size = None
 
         # CONSTANTS
@@ -453,11 +460,20 @@ class SteeringNode(Node):
         self.show_time_performance = False
         self.no_velocity = args.no_velocity
         self.time_look_ahead = args.time_look_ahead
+        self.taper_pedestrian_sweep = args.taper_pedestrian_sweep
         self.visualize = True
         self.save_video = False
         self.video_writer = None
         self.video_path = "esdf_debug.mp4"
         self.video_fps = 5.0
+        self.visualization_frame_dir = None
+        self.visualization_frame_index = 0
+        if getattr(args, "visualization_frame_dir", None):
+            self.visualization_frame_dir = FilePath(args.visualization_frame_dir).expanduser()
+            self.visualization_frame_dir.mkdir(parents=True, exist_ok=True)
+            self.get_logger().info(
+                f"Saving rendered steering frames to {self.visualization_frame_dir}"
+            )
 
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(
@@ -544,7 +560,7 @@ class SteeringNode(Node):
                 self.episode_callback,
                 qos_profile=episode_qos,
             )
-        if self.object_velocity_source == "sim-ground-truth":
+        if self.object_velocity_source == "sim-ground-truth" or self.velocity_reference_log:
             pedestrian_qos = QoSProfile(
                 reliability=QoSReliabilityPolicy.BEST_EFFORT,
                 history=QoSHistoryPolicy.KEEP_LAST,
@@ -598,7 +614,27 @@ class SteeringNode(Node):
             self.pub_started.publish(Empty())
             self.get_logger().info("Published /started (once).")
 
+        if getattr(args, "receiver_timing_log", None):
+            self.receiver_timing = ReceiverTiming(args.receiver_timing_log)
+            self._timing("settings", arguments=vars(args),
+                         batch_id=os.environ.get("BATCH_ID"),
+                         attempt_id=os.environ.get("RUN_ATTEMPT_ID"),
+                         T_base_from_cam=self.T_base_from_cam.tolist(),
+                         executor="single_threaded", clock_note="header stamps are ROS time; callback times are monotonic")
+
+    def _timing(self, event, **fields):
+        if self.receiver_timing is not None:
+            self.receiver_timing.emit(event, episode_id=self.episode_id, **fields)
+
+    def destroy_node(self):
+        if getattr(self, "receiver_timing", None) is not None:
+            error = self.receiver_timing.close()
+            if error:
+                self.get_logger().error(f"Receiver timing writer: {error}")
+        return super().destroy_node()
+
     def img_callback_obs(self, msg: Image):
+        callback_ns = time.monotonic_ns() if self.receiver_timing else None
         if self.compressed_img_topic:
             self.obs_img = self.br.compressed_imgmsg_to_cv2(msg)
         else:
@@ -611,6 +647,10 @@ class SteeringNode(Node):
         )
         if image_timestamp <= 0.0:
             image_timestamp = self.get_clock().now().nanoseconds * 1e-9
+        self._timing("image_callback", callback_monotonic_ns=callback_ns,
+                     header_stamp_ns=msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec,
+                     image_stamp=image_timestamp, stamp_fallback=(msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec <= 0),
+                     frame_id=msg.header.frame_id)
         self.obs_img = cv2.cvtColor(self.obs_img, cv2.COLOR_BGR2RGB)
         self.obs_img = PILImage.fromarray(self.obs_img)
         if self.obs_img.size != self.shrink_img_size:
@@ -621,6 +661,7 @@ class SteeringNode(Node):
             self.image_timestamp_queue.append(image_timestamp)
 
     def odom_callback_obs(self, msg: Odometry):
+        callback_ns = time.monotonic_ns() if self.receiver_timing else None
         self.robot_velocity_base[:] = [
             msg.twist.twist.linear.x,
             msg.twist.twist.linear.y,
@@ -666,22 +707,44 @@ class SteeringNode(Node):
                 maxlen=2000,
             )
 
+        if self.receiver_timing:
+            self._timing("odom_callback", callback_monotonic_ns=callback_ns,
+                         header_stamp_ns=msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec,
+                         odom_stamp=timestamp,
+                         stamp_fallback=(msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec <= 0),
+                         frame_id=msg.header.frame_id, child_frame_id=msg.child_frame_id,
+                         position=sample[1].tolist(), quaternion_xyzw=sample[2].tolist(),
+                         linear_velocity=self.robot_velocity_base.tolist(),
+                         angular_velocity=self.robot_angular_velocity_base.tolist())
+
     def get_base_pose_world(self, timestamp):
+        query_ns = time.monotonic_ns() if self.receiver_timing else None
+        error = None
         try:
             if self.odom_alignment == "endpoint":
-                return interpolate_pose_samples(
+                pose = interpolate_pose_samples(
                     self.odom_pose_buffer, timestamp, max_endpoint_gap=0.1
                 )
-            return pose_at_timestamp(
-                self.odom_pose_buffer,
-                self.odom_linear_velocity_buffer,
-                self.odom_angular_velocity_buffer,
-                timestamp,
-                max_extrapolation=self.odom_pose_max_extrapolation,
-            )
+            else:
+                pose = pose_at_timestamp(
+                    self.odom_pose_buffer,
+                    self.odom_linear_velocity_buffer,
+                    self.odom_angular_velocity_buffer,
+                    timestamp,
+                    max_extrapolation=self.odom_pose_max_extrapolation,
+                )
         except ValueError as exc:
             self.get_logger().warn(f"Invalid odometry pose: {exc}")
-            return None
+            pose, error = None, str(exc)
+        if self.receiver_timing:
+            self._timing("pose_query", query_monotonic_ns=query_ns,
+                         pose=None if pose is None else pose.tolist(),
+                         max_extrapolation=self.odom_pose_max_extrapolation,
+                         **alignment_details(self.odom_pose_buffer,
+                             self.odom_linear_velocity_buffer,
+                             self.odom_angular_velocity_buffer, timestamp,
+                             self.odom_alignment, pose is not None, error))
+        return pose
 
     def episode_callback(self, msg: String) -> None:
         """Clear all steering state before accepting data for a new sim episode."""
@@ -702,6 +765,8 @@ class SteeringNode(Node):
             return
 
         self.episode_id = episode_id
+        self.visualization_frame_index = 0
+        self._timing("episode_reset")
         self.image_queue.clear()
         self.image_timestamp_queue.clear()
         self.last_processed_image_timestamp = None
@@ -734,6 +799,10 @@ class SteeringNode(Node):
             return
         if episode_id != self.episode_id:
             return
+        if self.velocity_reference_log or (self.receiver_timing and self.object_velocity_source == "sim-ground-truth"):
+            self._timing("pedestrian_reference", reference_stamp=timestamp,
+                pedestrians={key: dict(position_world=position.tolist(), velocity_world=velocity.tolist())
+                             for key, (position, velocity) in pedestrians.items()})
         self.pedestrian_state_buffer.append((timestamp, pedestrians))
         if (
             len(self.pedestrian_state_buffer) > 1
@@ -906,6 +975,10 @@ class SteeringNode(Node):
                         sv.Detections.empty()
                     )
                     detections.data = {}
+                if self.velocity_reference_log or (self.receiver_timing and self.object_velocity_source == "sim-ground-truth"):
+                    self._timing("track_observations", image_stamp=image_timestamp,
+                        detected_ids=[int(i) for i in detections.tracker_id] if detections.tracker_id is not None else [],
+                        positions_camera={str(key): np.asarray(value).tolist() for key, value in pos_dict.items()})
                 # detection queue
                 self.detection_queue.append(detections)
                 self.detection_timestamp_queue.append(image_timestamp)
@@ -923,6 +996,8 @@ class SteeringNode(Node):
                 robot_velocity_camera = self.get_robot_velocity_camera()
                 robot_angular_velocity_camera = self.get_robot_angular_velocity_camera()
                 external_velocities_camera = {}
+                external_matches = {}
+                external_snapshot_stamp = None
                 if (
                     self.object_velocity_source == "sim-ground-truth"
                     and camera_pose_world is not None
@@ -935,6 +1010,7 @@ class SteeringNode(Node):
                     )
                     if snapshot is not None:
                         snapshot_timestamp, pedestrians_world = snapshot
+                        external_snapshot_stamp = snapshot_timestamp
                         pedestrians_world = advance_pedestrian_states(
                             pedestrians_world,
                             image_timestamp - snapshot_timestamp,
@@ -947,6 +1023,7 @@ class SteeringNode(Node):
                             pedestrians_camera,
                             max_ground_distance=self.pedestrian_match_distance,
                         )
+                        external_matches = matches
                         external_velocities_camera = {
                             track_id: match["velocity_camera"]
                             for track_id, match in matches.items()
@@ -956,6 +1033,14 @@ class SteeringNode(Node):
                     point_movement_bev = []
                     dynamic_projection_mask = np.zeros(points_input.shape[:2], dtype=bool)
                 else:
+                    # Diagnostics observe the existing fit; reference velocities never enter controls.
+                    def record_velocity(record):
+                        if self.object_velocity_source == "sim-ground-truth":
+                            match = external_matches.get(record["track_id"])
+                            record = dict(record, supplied_pedestrian_id=None if match is None else match["pedestrian_id"],
+                                supplied_match_distance=None if match is None else float(match["distance"]),
+                                supplied_snapshot_stamp=external_snapshot_stamp)
+                        self._timing("external_velocity" if self.object_velocity_source == "sim-ground-truth" else "visual_velocity", image_stamp=image_timestamp, **record)
                     # Update points according to detected obstacle velocities.
                     unprojected_points = points_input.copy()
                     trajectory_points, point_movement_cam = update_points(
@@ -967,12 +1052,14 @@ class SteeringNode(Node):
                         camera_poses_world=self.detection_camera_pose_queue,
                         # Number of recent observations in the visual velocity fit.
                         velocity_window=self.velocity_window,
+                        **({"velocity_diagnostics": record_velocity} if (self.velocity_reference_log or (self.receiver_timing and self.object_velocity_source == "sim-ground-truth")) else {}),
                         # Monocular depth varies slightly from frame to frame.
                         # A 0.1 m/s cutoff regularly turns that scale noise into
                         # motion on a stationary person while the robot drives.
                         min_dynamic_speed=0.25,
                         max_dynamic_speed=3.0,
                         time_look_ahead=self.time_look_ahead,
+                        taper=self.taper_pedestrian_sweep,
                         external_velocities_camera=external_velocities_camera,
                         allow_velocity_fallback=(
                             self.object_velocity_source != "sim-ground-truth"
@@ -1035,6 +1122,22 @@ class SteeringNode(Node):
                     self.previous_path_pose_world = None
                     self.previous_path_timestamp = None
 
+                if self.receiver_timing:
+                    self._timing("frame_result", image_stamp=image_timestamp,
+                                 processing_seconds=time.perf_counter()-t0,
+                                 no_velocity=self.no_velocity,
+                                 taper_pedestrian_sweep=self.taper_pedestrian_sweep,
+                                 detected_track_ids=[int(i) for i in detections.tracker_id] if detections.tracker_id is not None else [],
+                                 valid_position_track_ids=[int(i) for i in pos_dict],
+                                 camera_pose_history_available=[p is not None for p in self.detection_camera_pose_queue],
+                                 dynamic_projected_pixels=int(np.count_nonzero(dynamic_projection_mask)),
+                                 dynamic_sweep_count=len(point_movement_bev),
+                                 external_velocity_track_ids=[int(i) for i in external_velocities_camera],
+                                 temporal_prior_supplied=temporal_deformation is not None,
+                                 temporal_age=temporal_age,
+                                 temporal_memory_cleared=current_base_pose_world is None,
+                                 chosen_waypoint=np.asarray(chosen_waypoint).tolist())
+
                 # visualization code
                 if self.visualize:
                     # visualize only esdf, ~ 150ms
@@ -1061,6 +1164,28 @@ class SteeringNode(Node):
                     #                                     args=args)
                     frame_rgb = np.asarray(esdf_surface, dtype=np.uint8)
                     out_msg = self.br.cv2_to_imgmsg(frame_rgb, encoding="rgb8")
+
+                    if self.visualization_frame_dir is not None:
+                        safe_episode_id = "".join(
+                            char if char.isalnum() or char in "_.-" else "_"
+                            for char in (self.episode_id or "no_episode")
+                        )
+                        episode_dir = self.visualization_frame_dir / safe_episode_id
+                        episode_dir.mkdir(parents=True, exist_ok=True)
+                        image_stamp_ns = int(round(image_timestamp * 1_000_000_000))
+                        frame_path = episode_dir / (
+                            f"frame_{self.visualization_frame_index:06d}_"
+                            f"{image_stamp_ns}.jpg"
+                        )
+                        frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+                        if not cv2.imwrite(
+                            str(frame_path), frame_bgr,
+                            [cv2.IMWRITE_JPEG_QUALITY, 95],
+                        ):
+                            raise RuntimeError(
+                                f"Failed to save steering visualization: {frame_path}"
+                            )
+                        self.visualization_frame_index += 1
 
                     # Save visualization to video
                     if self.save_video:
@@ -1101,12 +1226,23 @@ def main(args: argparse.Namespace, ros_args=None):
     rclpy.init(args=ros_args)
     steering_node = SteeringNode(args)
 
+    # tmux shutdown sends HUP/TERM; allow the opt-in writer to drain first.
+    previous_handlers = {}
+    if steering_node.receiver_timing is not None:
+        def stop_for_timing(signum, frame):
+            signal.signal(signal.SIGHUP, signal.SIG_IGN)
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            raise KeyboardInterrupt
+        for signum in (signal.SIGHUP, signal.SIGTERM):
+            previous_handlers[signum] = signal.signal(signum, stop_for_timing)
     try:
         rclpy.spin(steering_node)
     except KeyboardInterrupt:
         pass
     finally:
         steering_node.destroy_node()
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
         import matplotlib.pyplot as plt
         plt.close("all")
 
@@ -1116,6 +1252,16 @@ def main(args: argparse.Namespace, ros_args=None):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="ros inference pipeline according to a depth-map ESDF."
+    )
+    parser.add_argument("--velocity-reference-log", action="store_true",
+                        help="Log visual velocities/rejection reasons and simulator pedestrian reference in shadow mode; requires receiver timing log.")
+    parser.add_argument("--receiver-timing-log", type=str, default=None,
+                        help="Opt-in bounded JSONL receiver timing log (new file; disabled by default).")
+    parser.add_argument(
+        "--visualization-frame-dir",
+        type=str,
+        default=None,
+        help="Save each rendered steering/RViz overlay as a JPEG under this directory, grouped by episode.",
     )
     parser.add_argument("-r", "--robot", type=str, help="Robot Name", default="husky")
     parser.add_argument(
@@ -1176,6 +1322,11 @@ if __name__ == "__main__":
         help="Obstacle-motion prediction lookahead in seconds.",
     )
     parser.add_argument(
+        "--taper-pedestrian-sweep",
+        action="store_true",
+        help="Taper predicted obstacle width to zero at the motion tip (default: full-width sweep).",
+    )
+    parser.add_argument(
         "--velocity-window", type=int, default=5,
         help="Maximum recent observations in the visual velocity fit (at least 3).",
     )
@@ -1211,6 +1362,8 @@ if __name__ == "__main__":
     args, ros_args = parser.parse_known_args()
     if ros_args and ros_args[0] != "--ros-args":
         parser.error(f"Unrecognized arguments: {ros_args}")
+    if args.velocity_reference_log and (not args.receiver_timing_log or args.robot != "sim_nova" or args.object_velocity_source != "estimated" or args.no_velocity):
+        parser.error("--velocity-reference-log requires sim_nova, estimated steered mode and --receiver-timing-log")
     if args.velocity_window < 3 or args.velocity_window > 20:
         parser.error("--velocity-window must be between 3 and 20")
     if args.image_queue_depth < 1:

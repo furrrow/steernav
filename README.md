@@ -168,3 +168,95 @@ waypoint x coordinates nondecreasing, preventing a truncated feasible path
 from pointing back toward the robot. The final feasible-prefix gate requires
 one robot radius of additional metric clearance beyond the inflated footprint.
 Visualization is currently always on.
+
+### Receiver timing diagnostics
+
+Receiver diagnostics are disabled by default. Use
+`--receiver-timing-log /absolute/path/to/new-file.jsonl` to record image/odometry
+callback entry times, original header stamps and fallback flags, pose-query
+brackets/source/gaps, raw odometry and frame-level projection/temporal availability.
+The bounded asynchronous writer counts dropped records and refuses to overwrite
+an existing capture. An orderly shutdown adds a `writer_summary`; check this and
+loss counts before interpreting the log. Callback times are monotonic; message
+stamps are ROS time. They must not be subtracted across clock domains.
+
+The NaVILA launcher forwards `STEERNAV_RECEIVER_TIMING_LOG`. TIC-VLA's
+`run_navila_odom_timing.bash` enables it alongside ROS bag recording and saves
+run provenance. `scripts/summarize_receiver_timing.py` in TIC-VLA summarizes
+matching-odometry callback order. A later callback does not establish DDS arrival
+order or prove the message was queued at query time. Detailed per-track velocity
+rejection reasons and shadow alignment are not implemented by this timing logger.
+Alignment selection and defaults are unchanged.
+
+
+For simulator-only shadow velocity diagnostics, add `--velocity-reference-log`
+together with `--receiver-timing-log`. It requires estimated steered mode on
+`sim_nova`. The node subscribes to simulator pedestrian states for logging only;
+these velocities never replace the visual estimates. `visual_velocity` records
+include fitted velocity before speed/evidence rejection, observation stamps,
+projection status and explicit skip reasons. `track_observations` records preserve
+detection/position coverage, including empty frames. The pinned custom_utils
+working tree now has an optional `velocity_diagnostics` callback; preserve that
+submodule change along with this node change.
+
+NaVILA forwards `STEERNAV_VELOCITY_REFERENCE_LOG=true`. TIC-VLA's
+`run_navila_velocity_comparison.bash` captures matched episode-12 runs under both
+alignments, twice with reversed order, and compares against independently recorded
+simulator states after each run. It uses later exact/bracketed odometry for the
+reference camera pose; unmatched/ambiguous tracks and missing reference data are
+reported as coverage exclusions. Both instantaneous and same-window reference
+errors are reported. Simulator motion and geometric identity matching still have
+uncertainty. Logging is opt-in; smoothing, gates and alignment defaults are unchanged.
+
+### Optional tapered pedestrian sweep
+
+The default velocity projection retains the full detected width at every prediction
+step. Add `--taper-pedestrian-sweep` to `steernav/ros_inference.py` to reduce the
+transverse ground-plane width linearly to zero at the prediction tip. This applies
+to both estimated and simulator velocities. Height, longitudinal extent, velocity,
+lookahead, and ESDF robot-radius clearance are unchanged. The finite footprint and
+ESDF clearance mean the final occupied region is a tapered wedge, not an exact triangle.
+
+This changes the geometry of the projected obstacle, rather than inflating or
+smoothing the pedestrian velocity. At the current position the detected width is
+preserved; farther along the motion direction the width decreases. The predicted
+travel distance remains velocity multiplied by the prediction horizon. Tapering
+therefore may reduce how much a sweep blocks the robot's path, but it cannot
+correct an inaccurate speed or direction estimate. Zero ground-plane displacement
+receives no taper.
+
+For a future comparison, pair full-width and tapered runs separately for each
+velocity source (`estimated` and `sim-ground-truth`) and odometry alignment
+(`extrapolate` and `endpoint`). Keep the episode, prediction horizon, velocity
+window, image buffering, robot radius, clearance margin, success threshold and
+stopping rules fixed. Compare projection coverage and navigation outcomes alongside
+velocity errors: tapering changes occupied geometry, so a navigation improvement
+alone does not establish more accurate velocity estimation.
+
+The flag is disabled by default. NaVILA launchers forward
+`STEERNAV_TAPER_PEDESTRIAN_SWEEP=true` to the node. TIC-VLA's
+`run_navila_velocity_comparison.bash` and `run_navila_odom_timing.bash` accept
+`--taper-pedestrian-sweep` (or the environment variable); use
+`--no-taper-pedestrian-sweep` to explicitly select the full-width baseline.
+The setting survives tmux handoffs and is recorded in comparison plans, capture
+provenance, analysis summaries and node `frame_result` records. Use a fresh batch
+for each geometry setting so previous results remain intact. For example:
+
+```bash
+cd /home/jim/Projects/TIC-VLA
+./run_navila_velocity_comparison.bash --velocity-source sim-ground-truth --taper-pedestrian-sweep
+```
+
+Without the option or environment override, existing runs retain full-width sweeps.
+
+
+Timing capture shutdown now uses a verified owner handshake: the writer creates
+`<log>.owner.json` with its process-start identity. The NaVILA launcher signals that
+process and waits for its `writer_summary` and exit before killing the tmux session.
+`<log>.shutdown.json` records success/failure of the handshake. The actual summary
+contains attempted/written/dropped counters and clean-shutdown status; absent
+summaries from older captures cannot be reconstructed. TIC-VLA captures now also
+save the original benchmark JSON, `episode_outcomes.csv`, `termination_summary.json`
+and `capture_status.json`. Episode termination records are separate from timing
+writer shutdown records. Missing episode outcomes, missing reasons or incomplete
+writer finalization cause a nonzero run status instead of a false completion.
