@@ -415,7 +415,7 @@ class SteeringNode(Node):
         self.lookahead_distance = float(robot_config["lookahead_distance"])
         if not np.isfinite(self.lookahead_distance) or self.lookahead_distance < 0:
             raise ValueError("lookahead_distance must be finite and >= 0")
-        args.robot_radius=robot_config["robot_radius"]
+        args.robot_radius = getattr(args, "robot_radius", None) or robot_config["robot_radius"]
         self.original_img_size = (deploy_config["img_w"], deploy_config["img_h"])  # (1280, 720)
         self.shrink_img_size = (deploy_config["shrink_w"], deploy_config["shrink_h"])  # (640, 480)
         self.detection_queue = []
@@ -625,13 +625,6 @@ class SteeringNode(Node):
     def _timing(self, event, **fields):
         if self.receiver_timing is not None:
             self.receiver_timing.emit(event, episode_id=self.episode_id, **fields)
-
-    def destroy_node(self):
-        if getattr(self, "receiver_timing", None) is not None:
-            error = self.receiver_timing.close()
-            if error:
-                self.get_logger().error(f"Receiver timing writer: {error}")
-        return super().destroy_node()
 
     def img_callback_obs(self, msg: Image):
         callback_ns = time.monotonic_ns() if self.receiver_timing else None
@@ -857,12 +850,24 @@ class SteeringNode(Node):
             self.paths_queue.append(np.array(waypoints))
 
     def destroy_node(self):
-        self.timer.cancel()
-        if self.video_writer is not None:
-            self.video_writer.release()
-            self.video_writer = None
-            self.get_logger().info(f"Saved video to {self.video_path}")
-        return super().destroy_node()
+        """Release every producer before draining telemetry; safe on repeated calls."""
+        if getattr(self, "_destroy_started", False):
+            return getattr(self, "_destroy_result", None)
+        self._destroy_started = True
+        for attribute, method in (("timer", "cancel"), ("video_writer", "release"),
+                                  ("receiver_timing", "close")):
+            resource = getattr(self, attribute, None)
+            setattr(self, attribute, None)
+            if resource is None:
+                continue
+            try:
+                error = getattr(resource, method)()
+                if attribute == "receiver_timing" and error:
+                    self.get_logger().error(f"Receiver timing writer: {error}")
+            except Exception as error:
+                self.get_logger().error(f"Cleanup {attribute}: {error}")
+        self._destroy_result = super().destroy_node()
+        return self._destroy_result
 
     def _infer_depth(self, obs_image):
         input_image = torch.from_numpy(obs_image).to(self.device).permute(2, 0, 1).float().div_(255.0)
@@ -1343,6 +1348,8 @@ if __name__ == "__main__":
         "--process-repeated-images", action="store_true",
         help="Allow repeated processing of the same image timestamp, as in crossover.",
     )
+    parser.add_argument("--robot-radius", type=float, default=None)
+    parser.add_argument("--additional-clearance", type=float, default=0.5)
     parser.add_argument("--h-min", type=float, default=0.5, help="Minimum kept height in meters.")
     parser.add_argument("--h-max", type=float, default=1.5, help="Maximum kept height in meters.")
     parser.add_argument("--x-min", type=float, default=0.0, help="Minimum forward extent in meters.")
@@ -1364,6 +1371,8 @@ if __name__ == "__main__":
         parser.error(f"Unrecognized arguments: {ros_args}")
     if args.velocity_reference_log and (not args.receiver_timing_log or args.robot != "sim_nova" or args.object_velocity_source != "estimated" or args.no_velocity):
         parser.error("--velocity-reference-log requires sim_nova, estimated steered mode and --receiver-timing-log")
+    if (args.robot_radius is not None and (not np.isfinite(args.robot_radius) or args.robot_radius <= 0)) or not np.isfinite(args.additional_clearance) or args.additional_clearance < 0:
+        parser.error("Radius must be positive and clearance nonnegative, both finite")
     if args.velocity_window < 3 or args.velocity_window > 20:
         parser.error("--velocity-window must be between 3 and 20")
     if args.image_queue_depth < 1:

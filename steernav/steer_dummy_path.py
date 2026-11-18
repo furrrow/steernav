@@ -794,7 +794,7 @@ def adam_update_numpy(
         args,
         grid_cell_centers=True,
     )
-    minimum_clearance = safety_clearance_margin()
+    minimum_clearance = getattr(args, "additional_clearance", safety_clearance_margin())
     safety_blocked_indices = np.flatnonzero(
         safety_clearance <= minimum_clearance
     )
@@ -923,7 +923,7 @@ def update_trajectories(args: Namespace,
         )
         temporal_point_weights = temporal_clearance_weights(
             temporal_clearance,
-            safety_clearance_margin(),
+            getattr(args, "additional_clearance", safety_clearance_margin()),
         )
         if bool(getattr(args, "debug_motion", False)):
             print(
