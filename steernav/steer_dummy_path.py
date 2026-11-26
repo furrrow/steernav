@@ -322,6 +322,39 @@ def sample_bev_map(
     )
 
 
+def path_clearance_diagnostics(esdf_result, args, input_path, initial_path,
+                               optimized_path, safe_path, selected_waypoint):
+    """Observe native gate samples without changing paths or planning decisions."""
+    threshold = float(getattr(args, "additional_clearance", safety_clearance_margin()))
+    result = dict(threshold=threshold, comparison="clearance > threshold",
+                  value_units="transformed ESDF minus robot radius; not Euclidean metres",
+                  robot_radius=float(args.robot_radius),
+                  grid_cell_centers=True,
+                  grid=dict(x_min=float(args.x_min), y_min=float(args.y_min),
+                            resolution=float(args.resolution)))
+    for name, points in (("input", input_path), ("initial", initial_path),
+                         ("optimized", optimized_path), ("safe", safe_path),
+                         ("selected", np.asarray(selected_waypoint).reshape(1, 2))):
+        xy = np.asarray(points)[:, :2]
+        values = sample_bev_map(xy, esdf_result["clearance"], args,
+                                grid_cell_centers=True)
+        rejected = np.flatnonzero(values <= threshold)
+        result[name] = dict(xy=xy.tolist(), clearance=values.tolist(),
+                            finite=np.isfinite(values).tolist(),
+                            passes=(values > threshold).tolist(),
+                            rejected_indices=rejected.tolist())
+    rejected = result["optimized"]["rejected_indices"]
+    result["first_rejected_index"] = rejected[0] if rejected else None
+    result["all_optimized_rejected"] = len(rejected) == len(result["optimized"]["xy"])
+    result["later_waypoints_pass"] = bool(rejected and any(
+        result["optimized"]["passes"][rejected[0]+1:]))
+    result["first_waypoint_skipped"] = bool(
+        rejected and rejected[0] == 0 and len(result["optimized"]["passes"]) > 1
+        and result["optimized"]["passes"][1])
+    result["prefix_start_index"] = 1 if result["first_waypoint_skipped"] else 0
+    return result
+
+
 def blocked_waypoint_diagnostics(
         path_xy: np.ndarray,
         z_scaled: np.ndarray,
@@ -629,10 +662,11 @@ def constrain_path_to_clearance_prefix(
         clearance: np.ndarray,
         minimum_clearance: float = 0.0,
 ) -> np.ndarray:
-    """Stop at the first waypoint without sufficient metric clearance.
+    """Keep a passing prefix, allowing the second point to replace a blocked first.
 
-    Clearance has already had the robot radius subtracted. Values at or below
-    ``minimum_clearance`` are therefore unsafe; positive values are feasible.
+    Only the first point may be skipped. If the second also fails, command stop;
+    otherwise retain the normal prefix gate for every subsequent point. This
+    waypoint gate does not certify continuous swept-footprint clearance.
     """
     if len(path) != len(clearance):
         raise ValueError("path and clearance must contain the same number of points")
@@ -647,7 +681,15 @@ def constrain_path_to_clearance_prefix(
 
     first_blocked_idx = int(blocked_indices[0])
     if first_blocked_idx == 0:
-        return np.zeros_like(path)
+        if len(path) < 2 or not (clearance[1] > minimum_clearance):
+            return np.zeros_like(path)
+        # Preserve the output shape while dropping only the rejected first point.
+        path = path.copy()
+        path[0] = path[1]
+        blocked_indices = blocked_indices[1:]
+        if len(blocked_indices) == 0:
+            return path
+        first_blocked_idx = int(blocked_indices[0])
 
     path = path.copy()
     path[first_blocked_idx:] = path[first_blocked_idx - 1]

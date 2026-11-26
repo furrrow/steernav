@@ -45,9 +45,9 @@ def test_clearance_gate_stops_at_first_occupied_or_unknown_waypoint():
     )
 
 
-def test_nonpositive_first_clearance_commands_stop():
+def test_first_two_blocked_waypoints_command_stop():
     path = np.array([[0.3, 0.0], [0.6, 0.1]])
-    result = constrain_path_to_clearance_prefix(path, np.array([-0.01, 0.4]))
+    result = constrain_path_to_clearance_prefix(path, np.array([-0.01, -0.1]))
     np.testing.assert_array_equal(result, np.zeros_like(path))
 
 
@@ -65,3 +65,29 @@ def test_fixed_margin_blocks_small_positive_clearance():
         result,
         [[0.3, 0.0], [0.3, 0.0], [0.3, 0.0]],
     )
+
+
+def test_blocked_first_uses_passing_second_waypoint():
+    path = np.array([[0.2, 0.0], [0.4, 0.1], [0.6, 0.2]])
+    original = path.copy()
+    result = constrain_path_to_clearance_prefix(path, np.array([0.1, 0.8, 0.9]), 0.5)
+    np.testing.assert_allclose(result, [path[1], path[1], path[2]])
+    np.testing.assert_array_equal(path, original)
+
+
+def test_first_skip_still_stops_at_later_blocked_waypoint():
+    path = np.array([[0.2, 0.0], [0.4, 0.1], [0.6, 0.2], [0.8, 0.3]])
+    result = constrain_path_to_clearance_prefix(path, np.array([0.1, 0.8, 0.2, 1.0]), 0.5)
+    np.testing.assert_allclose(result, np.repeat(path[1:2], 4, axis=0))
+
+
+def test_second_at_threshold_does_not_skip_to_passing_third():
+    path = np.array([[0.2, 0.0], [0.4, 0.1], [0.6, 0.2]])
+    result = constrain_path_to_clearance_prefix(path, np.array([0.1, 0.5, 0.9]), 0.5)
+    np.testing.assert_array_equal(result, np.zeros_like(path))
+
+
+def test_single_blocked_waypoint_stops():
+    path = np.array([[0.2, 0.0]])
+    result = constrain_path_to_clearance_prefix(path, np.array([0.1]), 0.5)
+    np.testing.assert_array_equal(result, np.zeros_like(path))

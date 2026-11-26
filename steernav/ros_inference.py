@@ -26,7 +26,8 @@ import threading
 from queue import Queue, Full, Empty
 # ROS2
 import rclpy
-from rclpy.clock import Clock, ClockType
+from rclpy.clock import JumpThreshold
+from rclpy.duration import Duration
 from rclpy.node import Node
 from sensor_msgs.msg import Image, CompressedImage
 from std_msgs.msg import Bool, Float32MultiArray, Empty, String
@@ -39,7 +40,7 @@ from custom_utils.io_utils import load_calibration, filter_unwanted_results
 
 from moge.model.v2 import MoGeModel
 import supervision as sv
-from steer_dummy_path import update_trajectories, transform_point
+from steer_dummy_path import update_trajectories, transform_point, path_clearance_diagnostics
 from custom_utils.pointcloud_utils import update_points
 from sim_pedestrians import (
     advance_pedestrian_states,
@@ -466,8 +467,10 @@ class SteeringNode(Node):
         self.video_writer = None
         self.video_path = "esdf_debug.mp4"
         self.video_fps = 5.0
+        self.visualization_save_interval = getattr(args, "visualization_save_interval", 2.0)
         self.visualization_frame_dir = None
         self.visualization_frame_index = 0
+        self._last_visualization_save_time = None
         if getattr(args, "visualization_frame_dir", None):
             self.visualization_frame_dir = FilePath(args.visualization_frame_dir).expanduser()
             self.visualization_frame_dir.mkdir(parents=True, exist_ok=True)
@@ -589,10 +592,16 @@ class SteeringNode(Node):
                                                          depth=10))
         # self.goal_pub = self.create_publisher(Bool, REACHED_GOAL_TOPIC, 1)
         self.pub_started = self.create_publisher(Empty, "/started", 10)
+        self._clock_epoch = 0
+        self._clock_reset_pending = False
+        self._clock_jump_handle = self.get_clock().create_jump_callback(
+            JumpThreshold(min_forward=None, min_backward=Duration(nanoseconds=-1), on_clock_change=True),
+            post_callback=self._on_behavior_clock_jump,
+        )
         self.timer = self.create_timer(
             1.0 / self.rate,
             lambda: self.run_steering_loop(args),
-            clock=Clock(clock_type=ClockType.STEADY_TIME),
+            clock=self.get_clock(),
         )
 
         # self.imsave_timer = self.create_timer(1, lambda: self.save_images_and_actions())
@@ -759,24 +768,9 @@ class SteeringNode(Node):
 
         self.episode_id = episode_id
         self.visualization_frame_index = 0
+        self._last_visualization_save_time = None
         self._timing("episode_reset")
-        self.image_queue.clear()
-        self.image_timestamp_queue.clear()
-        self.last_processed_image_timestamp = None
-        self.paths_queue.clear()
-        self.detection_queue.clear()
-        self.detection_timestamp_queue.clear()
-        self.detection_camera_pose_queue.clear()
-        self.odom_pose_buffer.clear()
-        self.odom_linear_velocity_buffer.clear()
-        self.odom_angular_velocity_buffer.clear()
-        self.previous_path_deformation = None
-        self.previous_path_pose_world = None
-        self.previous_path_timestamp = None
-        self.pedestrian_state_buffer.clear()
-        self.tracker = sv.ByteTrack()
-        self.robot_velocity_base.fill(0.0)
-        self.robot_angular_velocity_base.fill(0.0)
+        self._clear_clock_history()
 
         stop = Float32MultiArray()
         stop.data = [0.0, 0.0]
@@ -876,8 +870,7 @@ class SteeringNode(Node):
         estimated_cam_matrix = depth_model_output['intrinsics'].cpu().numpy()
         points_input = moge_points.astype(np.float32, copy=True)
         points_input[~depth_model_output["mask"].cpu().numpy().astype(bool)] = np.nan
-        depth = depth_model_output['depth'].cpu().numpy()
-        return points_input, estimated_cam_matrix, depth
+        return points_input, estimated_cam_matrix
 
     def _infer_bboxes(self, obs_image):
         obj_detect_inputs = (self.processor(text=self.prompt, images=obs_image, return_tensors="pt")
@@ -898,8 +891,40 @@ class SteeringNode(Node):
         bbox_only = [bbox for bbox, label in zip(bbox_result['bboxes'], bbox_result['labels'])]
         return bbox_result, bbox_only
 
+    def _on_behavior_clock_jump(self, _jump):
+        # Never read the clock, take model locks or reset a model inside this callback.
+        self._clock_epoch += 1
+        self._clock_reset_pending = True
+
+    def _clear_clock_history(self):
+        self.image_queue.clear()
+        self.image_timestamp_queue.clear()
+        self.last_processed_image_timestamp = None
+        self.paths_queue.clear()
+        self.detection_queue.clear()
+        self.detection_timestamp_queue.clear()
+        self.detection_camera_pose_queue.clear()
+        self.odom_pose_buffer.clear()
+        self.odom_linear_velocity_buffer.clear()
+        self.odom_angular_velocity_buffer.clear()
+        self.previous_path_deformation = None
+        self.previous_path_pose_world = None
+        self.previous_path_timestamp = None
+        self.pedestrian_state_buffer.clear()
+        self.tracker = sv.ByteTrack()
+        self.robot_velocity_base.fill(0.0)
+        self.robot_angular_velocity_base.fill(0.0)
+
+
     def run_steering_loop(self, args):
+        clock_epoch = self._clock_epoch
+        if self._clock_reset_pending:
+            self._clock_reset_pending = False
+            self._clear_clock_history()
         chosen_waypoint = np.zeros(2)
+        publication_image_stamp = None
+        publication_reason = "input_not_ready"
+        waypoint_published = False
         if self.require_episode and self.episode_id is None:
             return
         if (len(self.image_queue) > self.buffer_size) and (len(self.paths_queue) > 0):
@@ -916,11 +941,11 @@ class SteeringNode(Node):
                 vla_path = resample_path(last_path, num_waypoints=8)
 
                 if self.no_velocity:
-                    points_input, estimated_cam_matrix, depth = self._infer_depth(obs_image)
+                    points_input, estimated_cam_matrix = self._infer_depth(obs_image)
                     bbox_result = {"bboxes": [], "labels": []}
                     bbox_only = []
                 else:
-                    points_input, estimated_cam_matrix, depth = self._infer_depth(obs_image)
+                    points_input, estimated_cam_matrix = self._infer_depth(obs_image)
                     if self.show_time_performance:
                         t1 = time.perf_counter()
                         self.get_logger().info(f" === > depth_model inference took {(t1 - t0) * 1000:.1f} ms")
@@ -1127,8 +1152,24 @@ class SteeringNode(Node):
                     self.previous_path_pose_world = None
                     self.previous_path_timestamp = None
 
+                publication_image_stamp = image_timestamp
+                publication_reason = "selected"
                 if self.receiver_timing:
+                    diagnostic_start = time.perf_counter()
+                    try:
+                        path_clearance = path_clearance_diagnostics(
+                            esdf_result, args, vla_path, init_path_xy,
+                            untruncated_path_xy, opt_path_xy, chosen_waypoint)
+                    except Exception as exc:
+                        # Diagnostics must never suppress the planned publication.
+                        path_clearance = {"diagnostic_error": str(exc)}
+                    diagnostic_seconds = time.perf_counter() - diagnostic_start
                     self._timing("frame_result", image_stamp=image_timestamp,
+                                 image_stamp_ns=int(round(image_timestamp * 1_000_000_000)),
+                                 overlay_frame_index=self.visualization_frame_index,
+                                 ros_now_ns=self.get_clock().now().nanoseconds,
+                                 path_clearance=path_clearance,
+                                 clearance_diagnostic_seconds=diagnostic_seconds,
                                  processing_seconds=time.perf_counter()-t0,
                                  no_velocity=self.no_velocity,
                                  taper_pedestrian_sweep=self.taper_pedestrian_sweep,
@@ -1142,6 +1183,13 @@ class SteeringNode(Node):
                                  temporal_age=temporal_age,
                                  temporal_memory_cleared=current_base_pose_world is None,
                                  chosen_waypoint=np.asarray(chosen_waypoint).tolist())
+
+                # Control must not wait for rendering or synchronous JPEG writes.
+                if not self._publish_steered_waypoint(
+                    chosen_waypoint, publication_image_stamp, publication_reason, clock_epoch
+                ):
+                    return
+                waypoint_published = True
 
                 # visualization code
                 if self.visualize:
@@ -1170,7 +1218,8 @@ class SteeringNode(Node):
                     frame_rgb = np.asarray(esdf_surface, dtype=np.uint8)
                     out_msg = self.br.cv2_to_imgmsg(frame_rgb, encoding="rgb8")
 
-                    if self.visualization_frame_dir is not None:
+                    save_time = time.monotonic()
+                    if self._visualization_save_due(save_time):
                         safe_episode_id = "".join(
                             char if char.isalnum() or char in "_.-" else "_"
                             for char in (self.episode_id or "no_episode")
@@ -1190,6 +1239,7 @@ class SteeringNode(Node):
                             raise RuntimeError(
                                 f"Failed to save steering visualization: {frame_path}"
                             )
+                        self._last_visualization_save_time = save_time
                         self.visualization_frame_index += 1
 
                     # Save visualization to video
@@ -1216,9 +1266,33 @@ class SteeringNode(Node):
                         t5 = time.perf_counter()
                         self.get_logger().info(f"visualize + publish path took {(t5 - t4) * 1000:.1f} ms")
 
+        if not waypoint_published:
+            self._publish_steered_waypoint(
+                chosen_waypoint, publication_image_stamp, publication_reason, clock_epoch
+            )
+
+    def _visualization_save_due(self, now):
+        return self.visualization_frame_dir is not None and (
+            self._last_visualization_save_time is None
+            or now - self._last_visualization_save_time >= self.visualization_save_interval
+        )
+
+    def _publish_steered_waypoint(
+        self, chosen_waypoint, publication_image_stamp, publication_reason, clock_epoch
+    ):
+        if clock_epoch != self._clock_epoch:
+            return False
         waypoint_msg = Float32MultiArray()
         waypoint_msg.data = chosen_waypoint.flatten().tolist()
+        publish_start_ns = time.monotonic_ns() if self.receiver_timing else None
         self.steered_waypoint_pub.publish(waypoint_msg)
+        if self.receiver_timing:
+            self._timing("waypoint_published", image_stamp=publication_image_stamp,
+                         ros_now_ns=self.get_clock().now().nanoseconds,
+                         publish_start_ns=publish_start_ns, reason=publication_reason,
+                         waypoint=list(waypoint_msg.data))
+
+        return True
 
         # reached_goal = self.closest_node == self.goal_node
         # goal_reached_msg = Bool()
@@ -1266,7 +1340,11 @@ if __name__ == "__main__":
         "--visualization-frame-dir",
         type=str,
         default=None,
-        help="Save each rendered steering/RViz overlay as a JPEG under this directory, grouped by episode.",
+        help="Save steering/RViz overlays as JPEGs under this directory, grouped by episode.",
+    )
+    parser.add_argument(
+        "--visualization-save-interval", type=float, default=2.0,
+        help="Minimum wall-clock seconds between saved overlays (default: 2; 0 saves every frame).",
     )
     parser.add_argument("-r", "--robot", type=str, help="Robot Name", default="husky")
     parser.add_argument(
@@ -1379,4 +1457,6 @@ if __name__ == "__main__":
         parser.error("--image-queue-depth must be at least 1")
     if not np.isfinite(args.time_look_ahead) or args.time_look_ahead < 0:
         parser.error("--time-look-ahead must be finite and nonnegative")
+    if not np.isfinite(args.visualization_save_interval) or args.visualization_save_interval < 0:
+        parser.error("--visualization-save-interval must be finite and nonnegative")
     main(args, ros_args)
